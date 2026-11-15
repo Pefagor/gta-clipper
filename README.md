@@ -27,7 +27,6 @@ sent (пакет отправлен) → done`, либо `rejected / discarded /
    ```
    winget install Python.Python.3.12
    winget install Gyan.FFmpeg
-   winget install Streamlink.Streamlink
    winget install Git.Git
    ```
    Сборка Gyan.FFmpeg уже умеет субтитры (libass) и кодировщик видеокарты NVIDIA (NVENC).

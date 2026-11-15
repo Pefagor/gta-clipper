@@ -20,7 +20,7 @@ from .llm import LLMError, RouterAI, build_context
 from .recorder import Recorder
 from .render import render_clip, render_compilation
 from .segments import load_session_segments
-from .tools import find_ffmpeg, find_ffprobe, pick_encoder, probe, run
+from .tools import find_ffmpeg, find_ffprobe, pick_encoder, probe, run, streamlink_cmd
 from .transcribe import Transcriber, loud_events, read_wav, transcript_text, words_in
 from .twitch import TwitchAPI, parse_ts
 
@@ -37,7 +37,7 @@ class App:
         self.ffprobe = find_ffprobe(cfg.get("ffprobe", "auto"), self.ffmpeg)
         self.encoder = pick_encoder(self.ffmpeg, cfg.section("render").get("encoder", "auto"))
         s = cfg.secrets
-        self.twitch = TwitchAPI(s.twitch_client_id, s.twitch_client_secret, cfg.get("streamlink", "streamlink"))
+        self.twitch = TwitchAPI(s.twitch_client_id, s.twitch_client_secret, streamlink_cmd(cfg.get("streamlink", "auto")))
         self.chat = ChatHub()
         self.llm = RouterAI(cfg.section("llm"), s.routerai_key, on_usage=self._on_usage)
         self.transcriber = Transcriber(cfg.section("whisper"))

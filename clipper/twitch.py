@@ -15,10 +15,10 @@ HELIX = "https://api.twitch.tv/helix"
 
 
 class TwitchAPI:
-    def __init__(self, client_id: str, client_secret: str, streamlink: str = "streamlink"):
+    def __init__(self, client_id: str, client_secret: str, streamlink: list[str] | None = None):
         self.client_id = client_id
         self.client_secret = client_secret
-        self.streamlink = streamlink
+        self.streamlink = streamlink or ["streamlink"]
         self._token: str | None = None
         self._token_exp = 0.0
         self.http = httpx.AsyncClient(timeout=20)
@@ -71,7 +71,7 @@ class TwitchAPI:
     async def _streamlink_live(self, login: str) -> bool:
         try:
             proc = await asyncio.create_subprocess_exec(
-                self.streamlink, "--json", f"https://twitch.tv/{login}",
+                *self.streamlink, "--json", f"https://twitch.tv/{login}",
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
         except OSError:
             return False

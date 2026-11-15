@@ -12,6 +12,7 @@ from pathlib import Path
 import numpy as np
 
 from .segments import PartIndexer
+from .tools import streamlink_cmd
 
 log = logging.getLogger(__name__)
 
@@ -93,7 +94,7 @@ class Recorder:
         ff_log = open(part_dir / "ffmpeg.log", "ab")
         try:
             streamlink = await asyncio.create_subprocess_exec(
-                self.cfg.get("streamlink", "streamlink"), *(self.rec.get("streamlink_extra_args") or []),
+                *streamlink_cmd(self.cfg.get("streamlink", "auto")), *(self.rec.get("streamlink_extra_args") or []),
                 "--loglevel", "warning", "-O", f"https://twitch.tv/{self.login}", self.rec.get("quality", "best"),
                 stdout=w_fd, stderr=sl_log)
             ffmpeg = await asyncio.create_subprocess_exec(

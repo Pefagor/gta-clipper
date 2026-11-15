@@ -68,7 +68,11 @@ async def cmd_doctor(cfg) -> int:
         print(f"   кодировщик: {pick_encoder(ff, cfg.section('render').get('encoder', 'auto'))}")
     except RuntimeError as e:
         line(False, str(e))
-    line(bool(shutil.which(cfg.get("streamlink", "streamlink"))), "streamlink")
+    try:
+        from .tools import streamlink_cmd
+        line(True, "streamlink: " + " ".join(streamlink_cmd(cfg.get("streamlink", "auto"))))
+    except RuntimeError as e:
+        line(False, str(e))
     try:
         import ctranslate2
         n = ctranslate2.get_cuda_device_count()

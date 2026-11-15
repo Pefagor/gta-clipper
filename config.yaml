@@ -6,7 +6,7 @@ data_dir: data
 
 ffmpeg: auto          # auto = найти ffmpeg с поддержкой субтитров (libass); или полный путь
 ffprobe: auto
-streamlink: streamlink
+streamlink: auto      # auto = streamlink из виртуального окружения программы; или полный путь
 
 recording:
   quality: best

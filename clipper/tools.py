@@ -53,6 +53,21 @@ def find_ffmpeg(setting: str = "auto") -> str:
                        "новое окно терминала, либо укажите полный путь в config.yaml (ffmpeg: ...)")
 
 
+def streamlink_cmd(setting: str = "auto") -> list[str]:
+    """Команда запуска streamlink. По умолчанию — из виртуального окружения программы
+    (python -m streamlink), так он не зависит от PATH терминала."""
+    if setting and setting != "auto":
+        return [setting]
+    try:
+        import streamlink  # noqa: F401
+        return [sys.executable, "-m", "streamlink"]
+    except ImportError:
+        path = shutil.which("streamlink")
+        if path:
+            return [path]
+        raise RuntimeError("streamlink не найден: выполните pip install -e . в окружении программы")
+
+
 @lru_cache(maxsize=None)
 def find_ffprobe(setting: str = "auto", ffmpeg: str = "ffmpeg") -> str:
     if setting and setting != "auto":
