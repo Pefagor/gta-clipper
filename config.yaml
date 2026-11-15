@@ -1,0 +1,81 @@
+# Основные настройки. Секреты (ключи) лежат в .env.
+# То, что меняется кнопками в боте (чувствительность, лимиты публикаций, хэштеги),
+# хранится в базе и здесь задаёт только значения по умолчанию.
+
+data_dir: data
+
+ffmpeg: auto          # auto = найти ffmpeg с поддержкой субтитров (libass); или полный путь
+ffprobe: auto
+streamlink: streamlink
+
+recording:
+  quality: best
+  segment_seconds: 4
+  buffer_hours: 3
+  stall_seconds: 30          # нет новых сегментов столько секунд -> перезапуск записи
+  live_check_seconds: 60
+  streamlink_extra_args: ["--twitch-disable-ads"]
+
+detector:
+  tick_seconds: 2
+  window_seconds: 10
+  baseline_seconds: 600
+  warmup_seconds: 120
+  reaction_delay: 10         # реакция чата отстаёт от момента
+  pre_roll: 45
+  post_roll: 30
+  max_window: 90
+  cooldown: 60
+  thresholds: {low: 8.0, mid: 6.0, high: 4.5}   # чувствительность: меньше / средне / больше кандидатов
+  weights: {clips: 3.0, chat: 2.0, audio: 1.5, emotes: 1.0}
+  emotes: [KEKW, LUL, LULW, OMEGALUL, KEKL, ICANT, pepeLaugh, Pog, PogChamp, POGGERS, monkaS,
+           WutFace, "💀", "😂", "🤣", "ахах", "хаха", "ору", "лол", "кек", "???", "клип", "clip"]
+
+clips_poll_seconds: 30
+
+whisper:
+  model: large-v3-turbo
+  device: auto             # auto | cuda | cpu
+  compute_type: auto       # auto: float16 на видеокарте (с откатом на int8), int8 на процессоре
+  language: ru
+  beam_size: 5
+
+llm:
+  base_url: https://routerai.ru/api/v1
+  screen_model: anthropic/claude-haiku-5.5
+  review_model: anthropic/claude-sonnet-5.5
+  screen_threshold: 6
+  timeout: 120
+  # Цены в рублях за 1 млн токенов (вход, выход). Sonnet — с сайта routerai,
+  # Haiku — оценка, уточните в личном кабинете.
+  prices_rub:
+    anthropic/claude-haiku-5.5: [10.7, 53.3]
+    anthropic/claude-sonnet-5.5: [213, 1067]
+
+render:
+  width: 1080
+  height: 1920
+  fps: 30
+  max_file_mb: 45            # лимит Telegram-бота на отправку файла — 50 МБ
+  max_video_kbps: 8000
+  encoder: auto              # auto | h264_nvenc | h264_videotoolbox | libx264
+  font: Arial
+  loudness_lufs: -14
+
+compilation:
+  min_clips: 3
+  max_seconds: 90
+
+cleanup:
+  keep_clips_days: 7
+  keep_rejected_days: 1
+  min_free_gb: 20
+
+defaults:                    # стартовые значения настроек бота
+  sensitivity: mid
+  per_day: 10
+  interval_hours: 1.5
+  publish_mode: schedule     # schedule | now
+  hashtags: "#gta6 #гта6"
+  quiet: false
+  api_daily_limit_rub: 0     # 0 = без лимита
