@@ -119,10 +119,27 @@ def find_rect(E: np.ndarray, face: tuple[float, float, float, float]) -> tuple[t
         if rh <= 0 or not (0.9 <= rw / rh <= 2.4 and 2.0 * fw <= rw <= 9 * fw):
             continue
         s = [side(T, B, L, True), side(T, B, R, True), side(L, R, T, False), side(L, R, B, False)]
-        score = min(s) * 0.6 + float(np.mean(s)) * 0.4 + 0.02 * (rw * rh) / (w * h)
+        edges = min(s) * 0.6 + float(np.mean(s)) * 0.4
+        score = edges + 0.25 * composition((L, T, R, B), face)
         if score > best_score:
             best, best_score = (L, T, R, B), score
     return best, round(best_score, 3)
+
+
+def composition(rect, face) -> float:
+    """0..1: насколько рамка похожа на кадр вебки: пропорции камеры (4:3–16:9), лицо примерно по центру
+    по горизонтали и в средней части по вертикали, лицо не крошечное. Панели интерфейса, внутри которых
+    стоит вебка, тоже дают замкнутую рамку, но по этим признакам проигрывают."""
+    L, T, R, B = rect
+    fx, fy, fw, fh = face
+    rw, rh = R - L, B - T
+    ar = rw / rh
+    relx, rely = (fx + fw / 2 - L) / rw, (fy + fh / 2 - T) / rh
+    pen = (max(0.0, abs(relx - 0.5) - 0.15) * 3
+           + max(0.0, 0.25 - rely, rely - 0.65) * 3
+           + max(0.0, 0.2 - fh / rh) * 5
+           + (max(0.0, 1.2 - ar) * 2 if ar < 1.2 else max(0.0, ar - 1.9) * 2))
+    return max(0.0, 1.0 - min(1.0, pen))
 
 
 def estimate_rect(face, w: int, h: int) -> tuple[int, int, int, int]:

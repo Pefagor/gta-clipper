@@ -44,10 +44,13 @@ def test_find_rect_synthetic():
     assert abs(L - 700) <= 3 and T <= 2 and R >= 957 and abs(B - 220) <= 3
 
 
-@pytest.mark.skipif(not LOCAL.exists(), reason="кадры реального стрима есть только локально (не в git)")
-def test_find_cam_real_stream(tmp_path):
+@pytest.mark.parametrize("folder", ["stariy_bog", "stariy_bog_menu"])  # игра и меню выбора героя (статичный UI)
+def test_find_cam_real_stream(tmp_path, folder):
+    frames = LOCAL.parent / folder
+    if not frames.exists():
+        pytest.skip("кадры реального стрима есть только локально (не в git)")
     out = subprocess.run([sys.executable, "-m", "clipper.camcal", "find", str(tmp_path / "preview.jpg"),
-                          *map(str, sorted(LOCAL.glob("*.jpg")))], capture_output=True, text=True, cwd=ROOT)
+                          *map(str, sorted(frames.glob("*.jpg")))], capture_output=True, text=True, cwd=ROOT)
     res = json.loads(out.stdout.strip().splitlines()[-1])
     assert res["method"] == "edges"
     x, y, w, h = res["rect"]
