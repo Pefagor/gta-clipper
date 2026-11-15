@@ -31,21 +31,34 @@ sent (пакет отправлен) → done`, либо `rejected / discarded /
    winget install Git.Git
    ```
    Сборка Gyan.FFmpeg уже умеет субтитры (libass) и кодировщик видеокарты NVIDIA (NVENC).
-2. Скачайте проект и установите зависимости:
+2. Скачайте проект и создайте виртуальное окружение:
    ```
-   git clone <адрес репозитория> gta-clipper
+   git clone https://github.com/Pefagor/gta-clipper.git
    cd gta-clipper
    py -3.12 -m venv .venv
-   .venv\Scripts\pip install -e .
    ```
-3. Распознавание речи на видеокарте: faster-whisper использует CUDA 12 и cuDNN 9. Проще всего:
+3. Активируйте окружение. Это нужно делать в каждом новом окне терминала; признак успеха — `(.venv)`
+   в начале строки. Все команды ниже и в остальном README пишутся уже без пути к `.venv`.
    ```
-   .venv\Scripts\pip install nvidia-cublas-cu12 nvidia-cudnn-cu12
+   .venv\Scripts\activate
+   ```
+   Если PowerShell пишет, что выполнение сценариев запрещено, один раз выполните
+   `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` и повторите активацию.
+   На macOS/Linux: `source .venv/bin/activate`.
+4. Установите зависимости:
+   ```
+   pip install -e .
+   ```
+5. Распознавание речи на видеокарте: faster-whisper использует CUDA 12 и cuDNN 9. Проще всего:
+   ```
+   pip install nvidia-cublas-cu12 nvidia-cudnn-cu12
    ```
    Если видеокарта не подхватится, программа сама перейдёт на процессор (медленнее, но работает).
-4. Скопируйте `.env.example` в `.env` и впишите ключи (как их получить — ниже).
-5. Проверьте установку: `.venv\Scripts\python -m clipper doctor`
-6. Запуск: `.venv\Scripts\python -m clipper run`
+6. Скопируйте `.env.example` в `.env` (`copy .env.example .env`) и впишите ключи (как их получить — ниже).
+7. Проверьте установку: `python -m clipper doctor`
+8. Запуск: `python -m clipper run`
+
+Обновление до новой версии: `git pull`, затем `pip install -e .` (в активированном окружении).
 
 На macOS: `brew install ffmpeg-full streamlink`, дальше так же (ffmpeg-full нужен ради субтитров).
 
@@ -156,6 +169,6 @@ data/              записи, кандидаты, база, логи (не в
 ## Тесты
 
 ```
-pip install -e .[dev]
+pip install -e ".[dev]"
 python -m pytest
 ```
