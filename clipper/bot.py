@@ -15,15 +15,15 @@ from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.filters import BaseFilter, Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import (CallbackQuery, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton,
-                           Message, ReplyKeyboardMarkup)
+from aiogram.types import (CallbackQuery, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto,
+                           KeyboardButton, Message, ReplyKeyboardMarkup)
 
 from .db import day_start
 
 log = logging.getLogger(__name__)
 
 BTN_MOD, BTN_PUB, BTN_CH, BTN_ST, BTN_SET = "🎬 Модерация", "📤 Публикация", "📺 Каналы", "📊 Статус", "⚙️ Настройки"
-CAT_ICON = {"смешное": "😂", "баг": "🐞", "погоня": "🚓", "реакция": "😱", "эпичное": "🔥", "подборка": "🎞",
+CAT_ICON = {"смешное": "😂", "рейдж": "🤬", "баг": "🐞", "погоня": "🚓", "реакция": "😱", "эпичное": "🔥", "подборка": "🎞",
             "другое": "🎬"}
 SENS = {"low": "Меньше кандидатов", "mid": "Средне", "high": "Больше"}
 
@@ -65,6 +65,28 @@ def ago(ts: float | None) -> str:
         return "—"
     m = int((time.time() - ts) / 60)
     return f"{m} мин назад" if m < 60 else f"{m // 60} ч {m % 60} мин назад"
+
+
+def adjust_rect(rect: list[float], op: str, move: float = 0.01, grow: float = 0.05) -> list[float]:
+    """Сдвиг/размер рамки вебки (доли кадра); рамка остаётся внутри кадра."""
+    x, y, w, h = rect
+    if op == "l":
+        x -= move
+    elif op == "r":
+        x += move
+    elif op == "u":
+        y -= move
+    elif op == "d":
+        y += move
+    elif op in ("w+", "w-"):
+        nw = w * (1 + grow if op == "w+" else 1 - grow)
+        x, w = x - (nw - w) / 2, nw
+    elif op in ("h+", "h-"):
+        nh = h * (1 + grow if op == "h+" else 1 - grow)
+        y, h = y - (nh - h) / 2, nh
+    w, h = min(max(w, 0.03), 1.0), min(max(h, 0.03), 1.0)
+    x, y = min(max(x, 0.0), 1.0 - w), min(max(y, 0.0), 1.0 - h)
+    return [round(x, 4), round(y, 4), round(w, 4), round(h, 4)]
 
 
 def rating(c: dict) -> str:
@@ -643,19 +665,37 @@ class BotUI:
             await m.answer("⚠️ Каналов больше 6: проверьте, хватит ли интернета (~8 Мбит/с на канал) и диска.")
 
     # ================= вебка =================
-    async def send_cam_proposal(self, login: str, photo: Path | None, rect) -> None:
+    def _cam_kb(self, login: str, rect) -> InlineKeyboardMarkup:
+        rows = [[("✅ Верно", f"cam:ok:{login}"), ("✏️ Подправить", f"cam:adj:{login}")]] if rect else []
+        rows.append([("🔄 Искать снова", f"cam:retry:{login}"), ("🚫 Без вебки", f"cam:none:{login}")])
+        return kb(rows)
+
+    def _cam_adjust_kb(self, login: str) -> InlineKeyboardMarkup:
+        return kb([[("⬅️", f"cm:l:{login}"), ("⬆️", f"cm:u:{login}"), ("⬇️", f"cm:d:{login}"), ("➡️", f"cm:r:{login}")],
+                   [("↔️ шире", f"cm:w+:{login}"), ("↔️ уже", f"cm:w-:{login}"),
+                    ("↕️ выше", f"cm:h+:{login}"), ("↕️ ниже", f"cm:h-:{login}")],
+                   [("✅ Готово", f"cam:ok:{login}"), ("← Назад", f"cm:back:{login}")]])
+
+    @staticmethod
+    def _cam_caption(name: str, rect, method: str | None) -> str:
+        if not rect:
+            return f"🎥 <b>{name}</b>: вебку не нашёл."
+        if method == "estimate":
+            return (f"🎥 <b>{name}</b>: нашёл лицо, но края вебки не видны — рамка примерная (жёлтая). "
+                    "Проверьте и при необходимости подправьте.")
+        return f"🎥 <b>{name}</b>: вебка здесь? (зелёная рамка)"
+
+    async def send_cam_proposal(self, login: str, photo: Path | None, rect, method: str | None = None) -> None:
         if not self.owner_id:
             return
         name = html.escape((self.db.channel(login) or {}).get("display_name") or login)
-        text = (f"🎥 <b>{name}</b>: вебка здесь? (зелёная рамка)" if rect
-                else f"🎥 <b>{name}</b>: вебку не нашёл.")
-        buttons = [[("✅ Верно", f"cam:ok:{login}")]] if rect else []
-        buttons.append([("🔄 Искать снова", f"cam:retry:{login}"), ("🚫 Без вебки", f"cam:none:{login}")])
+        text = self._cam_caption(name, rect, method)
+        buttons = self._cam_kb(login, rect)
         try:
             if photo:
-                await self.bot.send_photo(self.owner_id, FSInputFile(photo), caption=text, reply_markup=kb(buttons))
+                await self.bot.send_photo(self.owner_id, FSInputFile(photo), caption=text, reply_markup=buttons)
             else:
-                await self.bot.send_message(self.owner_id, text, reply_markup=kb(buttons))
+                await self.bot.send_message(self.owner_id, text, reply_markup=buttons)
         except Exception as e:  # noqa: BLE001
             log.warning("telegram: %s", e)
 
@@ -673,6 +713,29 @@ class BotUI:
             await self._safe(q.message.delete())
             self.spawn(self.app.calibrate_cam(login))
             return await q.answer("Ищу снова")
+        elif action == "adj":
+            await self._safe(q.message.edit_reply_markup(reply_markup=self._cam_adjust_kb(login)))
+        await self._safe(q.answer())
+
+    async def cb_cm(self, q, state, action, arg, parts):
+        """Ручная подстройка рамки вебки: сдвиг на 1% кадра, размер на 5%."""
+        login = arg
+        rect = self.db.kv_get(f"cam:{login}")
+        if not rect:
+            return await q.answer("Рамки нет — нажмите «Искать снова»", show_alert=True)
+        if action == "back":
+            await self._safe(q.message.edit_reply_markup(reply_markup=self._cam_kb(login, rect)))
+            return await q.answer()
+        rect = adjust_rect(rect, action)
+        self.db.kv_set(f"cam:{login}", rect)
+        self.db.kv_set(f"cam_method:{login}", "manual")
+        photo = await self.app.draw_cam_preview(login, rect)
+        name = html.escape((self.db.channel(login) or {}).get("display_name") or login)
+        caption = f"🎥 <b>{name}</b>: подстройка рамки. Нажмите «Готово», когда рамка совпадёт с вебкой."
+        if photo:
+            await self._safe(q.message.edit_media(
+                media=InputMediaPhoto(media=FSInputFile(photo), caption=caption),
+                reply_markup=self._cam_adjust_kb(login)))
         await self._safe(q.answer())
 
     # ================= статус =================

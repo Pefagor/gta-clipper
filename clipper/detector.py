@@ -43,6 +43,27 @@ def mean_audio(audio, start: float, end: float) -> float | None:
     return sum(vals) / len(vals) if vals else None
 
 
+def recent_chunks(audio, start: float, end: float) -> list[tuple[float, float]]:
+    out = []
+    for t, db in reversed(audio):
+        if t < start:
+            break
+        if t <= end:
+            out.append((t, db))
+    return out
+
+
+def loudest(audio, start: float, end: float) -> float | None:
+    """Время самого громкого фрагмента в [start, end]."""
+    best_t, best_db = None, -1e9
+    for t, db in reversed(audio):
+        if t < start:
+            break
+        if t <= end and db > best_db:
+            best_t, best_db = t, db
+    return best_t
+
+
 def zscore(x: float, values: list[float], min_std: float) -> float:
     if len(values) < 5:
         return 0.0
@@ -79,7 +100,21 @@ class ChannelDetector:
         chat_z = zscore(chat_n, base_chat, min_std=max(1.0, statistics.fmean(base_chat) * 0.25))
         audio_vals = [s.audio for s in base if s.audio is not None]
         audio_z = zscore(audio_db, audio_vals, min_std=3.0) if audio_db is not None and len(audio_vals) >= 15 else 0.0
-        if chat_n == 0:  # громкий звук без всякой реакции чата — не момент
+        # Рейдж: стример орёт заметно громче обычного (по умолчанию +9 дБ ≈ в 2 раза громче на слух).
+        # Такой момент берём даже при молчащем чате.
+        # Среднее за 3 с размывает короткий крик, поэтому рейдж смотрим по кускам по 0.5 с:
+        # хотя бы секунда (2 куска) должна быть громче обычного уровня на rage_db.
+        loud_by, rage = 0.0, False
+        if len(audio_vals) >= 15:
+            usual = statistics.median(audio_vals)
+            spread = max(statistics.pstdev(audio_vals), 3.0)
+            recent = sorted((db for t, db in recent_chunks(audio, now - 3, now) if db > SILENCE_DB), reverse=True)
+            if len(recent) >= 2:
+                loud_by = recent[1] - usual  # второй по громкости кусок: крик длится хотя бы 1 с
+                rage = loud_by >= c.get("rage_db", 9.0) and loud_by / spread >= c.get("rage_min_z", 2.5)
+                if rage:
+                    audio_z = max(audio_z, loud_by / spread)
+        if chat_n == 0 and not rage:  # просто громкий звук без всякой реакции чата — не момент
             audio_z = min(audio_z, 1.0)
         mean_chat = statistics.fmean(base_chat)
         emote_score = min(3.0, emote_n / max(4.0, mean_chat)) if chat_n else 0.0
@@ -92,7 +127,17 @@ class ChannelDetector:
                  + w.get("audio", 1.5) * min(max(audio_z, 0), 5)
                  + w.get("emotes", 1) * emote_score)
         signals.update(chat_z=round(chat_z, 2), audio_z=round(audio_z, 2), emote_score=round(emote_score, 2),
-                       clips=clips)
+                       clips=clips, loud_by_db=round(loud_by, 1))
+        # Момент «по звуку»: крик сильнее реакции чата — тогда окно привязываем к секунде крика,
+        # а не к «сейчас минус задержка чата».
+        audio_part = w.get("audio", 1.5) * min(max(audio_z, 0), 5)
+        chat_part = w.get("chat", 2) * min(max(chat_z, 0), 5)
+        if rage or (audio_part > 0 and audio_part >= chat_part):
+            peak_t = loudest(audio, now - 4, now)
+            if peak_t is not None:
+                signals["audio_peak_t"] = round(peak_t, 2)
+        if rage:
+            signals["rage"] = True
         return round(score, 2), signals
 
 
@@ -110,7 +155,9 @@ def plan_window(peak: float, cfg: dict) -> tuple[float, float]:
     return peak - cfg.get("pre_roll", 45), peak + cfg.get("post_roll", 30)
 
 
-def extend_window(w: OpenWindow, now: float, cfg: dict) -> None:
-    reaction = cfg.get("reaction_delay", 10)
-    new_end = now - reaction + cfg.get("post_roll", 30) * 0.66
+def extend_window(w: OpenWindow, now: float, cfg: dict, peak: float | None = None) -> None:
+    """Активность продолжается — растягиваем окно, чтобы в клип попала развязка (не дальше max_window)."""
+    if peak is None:
+        peak = now - cfg.get("reaction_delay", 10)
+    new_end = peak + cfg.get("post_roll", 30) * 0.66
     w.end = min(max(w.end, new_end), w.start + cfg.get("max_window", 90))

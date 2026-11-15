@@ -21,7 +21,7 @@ from .recorder import Recorder
 from .render import render_clip, render_compilation
 from .segments import load_session_segments
 from .tools import find_ffmpeg, find_ffprobe, pick_encoder, probe, run
-from .transcribe import Transcriber, transcript_text, words_in
+from .transcribe import Transcriber, loud_events, read_wav, transcript_text, words_in
 from .twitch import TwitchAPI, parse_ts
 
 log = logging.getLogger(__name__)
@@ -250,17 +250,19 @@ class App:
                     det = self.detectors[login]
                     score, signals = det.tick(now, self.chat.history(login), rec.audio, list(self.clip_moments[login]))
                     win = self.open_windows.get(login)
-                    if score >= thr:
+                    if score >= thr or signals.get("rage"):
+                        # момент «по звуку» привязан к секунде крика, по чату — к «сейчас минус задержка чата»
+                        peak = signals.get("audio_peak_t") or now - dcfg.get("reaction_delay", 10)
                         if win:
-                            extend_window(win, now, dcfg)
+                            extend_window(win, now, dcfg, peak)
                             self.last_end[login] = win.end
                             win.max_score = max(win.max_score, score)
                             self.db.update_candidate(win.cid, win_end=win.end, score=win.max_score,
                                                      next_try_at=win.end + seg + 3)
-                        elif now - dcfg.get("reaction_delay", 10) > self.last_end.get(login, 0) + 5:
+                        elif peak > self.last_end.get(login, 0) + 5:
                             # новый момент — только после конца окна предыдущего, без дублей
-                            self._new_candidate(login, rec, now - dcfg.get("reaction_delay", 10), score,
-                                                signals, "detector", track=True)
+                            self._new_candidate(login, rec, peak, score, signals,
+                                                "rage" if signals.get("rage") else "detector", track=True)
                     if win and now > win.end + seg + 3:
                         self.open_windows.pop(login, None)
             except Exception:  # noqa: BLE001
@@ -379,6 +381,10 @@ class App:
         wav = d / "audio.wav"
         await extract_audio(self.ffmpeg, d / "raw.mp4", wav)
         tr = await asyncio.to_thread(self.transcriber.transcribe, wav)
+        try:  # крики — по самому звуку: Whisper громкость не передаёт
+            tr["loud"] = await asyncio.to_thread(lambda: loud_events(read_wav(wav)))
+        except Exception as e:  # noqa: BLE001
+            log.warning("громкость кандидата #%d: %s", c["id"], e)
         (d / "transcript.json").write_text(json.dumps(tr, ensure_ascii=False), encoding="utf-8")
         wav.unlink(missing_ok=True)
         self.db.update_candidate(c["id"], status="transcribed", attempts=0, error=None)
@@ -420,7 +426,8 @@ class App:
         if not self.llm.enabled:  # без ключа routerai: пропускаем ИИ, на модерацию идёт всё окно
             self.db.update_candidate(c["id"], status="to_render", screen={"skipped": True}, clip_start=0.0,
                                      clip_end=c["raw_duration"], titles=["Момент со стрима"],
-                                     title="Момент со стрима", category="другое")
+                                     title="Момент со стрима",
+                                     category="рейдж" if c.get("trigger") == "rage" else "другое")
             return
         if not await self._budget_ok(c):
             return
@@ -456,6 +463,10 @@ class App:
         start, end = max(0.0, start), min(info["duration"] or c["raw_duration"], end)
         ch = self.db.channel(c["channel"]) or {}
         cam = (ch["cam_x"], ch["cam_y"], ch["cam_w"], ch["cam_h"]) if ch.get("cam_status") == "ok" else None
+        if cam and not await self._cam_present(raw, d, cam, start, end):
+            # стример поменял раскладку (полноэкранная вебка, сцена «отошёл») — макет без вебки
+            log.info("кандидат #%d: в рамке вебки нет лица, рендер без вебки", c["id"])
+            cam = None
         tr = json.loads((d / "transcript.json").read_text(encoding="utf-8"))
         out = d / "clip.mp4"
         await render_clip(self.ffmpeg, self.encoder, raw, out, start, end, info["width"], info["height"], cam,
@@ -464,6 +475,23 @@ class App:
         self.db.update_candidate(c["id"], status="rendered", render_path=str(out), render_duration=end - start,
                                  clip_start=start, clip_end=end, edit_start=None, edit_end=None,
                                  card_msg_id=None, attempts=0, error=None)
+
+    async def _cam_present(self, raw: Path, d: Path, cam, start: float, end: float) -> bool:
+        if not self.cfg.section("render").get("check_cam", True):
+            return True
+        frames = await extract_frames(self.ffmpeg, raw, d, spread(end - start, 4, None, None), "cam", scale=None,
+                                      offset=start)
+        if not frames:
+            return True
+        code, out = await run([sys.executable, "-m", "clipper.camcal", "check", *map(str, cam),
+                               *(str(p) for _, p in frames)], timeout=120)
+        for _, p in frames:
+            p.unlink(missing_ok=True)
+        try:
+            return bool(json.loads(out.strip().splitlines()[-1])["present"]) if code == 0 else True
+        except (ValueError, KeyError, IndexError):
+            log.warning("проверка вебки: %s", out[-300:])
+            return True  # проверка сломалась — не портим клип, оставляем вебку
 
     # ---------- подборки ----------
     def compilation_tags(self) -> list[tuple[str, int]]:
@@ -530,34 +558,59 @@ class App:
         rec = self.recorders.get(login)
         if not rec:
             return False
-        segs = (await asyncio.to_thread(load_session_segments, rec.session_dir))[-40:]
-        if not segs:
+        # 24 кадра из последних ~3 минут: край вебки постоянен, игра вокруг меняется
+        segs = (await asyncio.to_thread(load_session_segments, rec.session_dir))[-45:]
+        if len(segs) < 8:
             return False
-        picks = [segs[int(i * (len(segs) - 1) / 5)] for i in range(6)]
+        n = min(24, len(segs))
+        picks = [segs[int(i * (len(segs) - 1) / (n - 1))] for i in range(n)]
         work = self.cfg.data_dir / "cam" / login
+        shutil.rmtree(work, ignore_errors=True)
         work.mkdir(parents=True, exist_ok=True)
         frames = []
         for i, s in enumerate(picks):
-            p = work / f"f{i}.jpg"
+            p = work / f"f{i:02d}.jpg"
             code, _ = await run([self.ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-i", str(s.path),
-                                 "-frames:v", "1", str(p)], timeout=60)
+                                 "-frames:v", "1", "-q:v", "3", str(p)], timeout=60)
             if code == 0 and p.exists():
                 frames.append(str(p))
-        if not frames:
+        if len(frames) < 6:
             return False
         preview = work / "preview.jpg"
-        code, out = await run([sys.executable, "-m", "clipper.camcal", str(preview), *frames], timeout=120)
-        rect = None
+        code, out = await run([sys.executable, "-m", "clipper.camcal", "find", str(preview), *frames], timeout=180)
         try:
-            rect = json.loads(out.strip().splitlines()[-1]).get("rect") if code == 0 else None
+            res = json.loads(out.strip().splitlines()[-1]) if code == 0 else {}
         except (ValueError, IndexError):
-            log.warning("camcal: %s", out[-300:])
-        self.db.kv_set(f"cam:{login}", rect)
+            res = {}
+        if not res:
+            log.warning("camcal: %s", out[-500:])
+            return False
+        # последний кадр — основа для перерисовки рамки при ручной подстройке
+        shutil.copy(frames[-1], work / "base.jpg")
+        self.db.kv_set(f"cam:{login}", res.get("rect"))
+        self.db.kv_set(f"cam_method:{login}", res.get("method"))
+        log.info("[%s] вебка: %s (%s)", login, res.get("rect"), res.get("method"))
         if self.bot:
-            await self.bot.send_cam_proposal(login, preview if preview.exists() else None, rect)
-        else:  # без бота принимаем как есть
-            self.accept_cam(login, rect)
+            await self.bot.send_cam_proposal(login, preview if preview.exists() else None, res.get("rect"),
+                                             res.get("method"))
+        elif res.get("method") == "edges":  # без бота принимаем только уверенную рамку
+            self.accept_cam(login, res.get("rect"))
+        else:
+            self.accept_cam(login, None)
         return True
+
+    async def draw_cam_preview(self, login: str, rect) -> Path | None:
+        """Перерисовывает рамку на сохранённом кадре (для ручной подстройки)."""
+        work = self.cfg.data_dir / "cam" / login
+        base, out = work / "base.jpg", work / "adjust.jpg"
+        if not base.exists():
+            return None
+        code, log_out = await run([sys.executable, "-m", "clipper.camcal", "draw", str(base), str(out),
+                                   *map(str, rect)], timeout=60)
+        if code != 0:
+            log.warning("рамка вебки: %s", log_out[-300:])
+            return None
+        return out
 
     def accept_cam(self, login: str, rect) -> None:
         if rect:

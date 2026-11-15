@@ -103,9 +103,42 @@ def _looks_broken(result: dict) -> bool:
     return bool(segs) and (not text.strip() or len(set(text.replace(" ", ""))) <= 2)
 
 
+def loud_events(samples, rate: int = 16000, step: float = 0.5, over_db: float = 9.0,
+                silence_db: float = -60.0) -> list[dict]:
+    """Крики: отрезки, где звук громче обычного уровня этого фрагмента на over_db и больше.
+
+    Обычный уровень — медиана громкости по кускам step секунд (тишина не учитывается)."""
+    import numpy as np
+    n = int(rate * step)
+    if len(samples) < n * 4:
+        return []
+    chunks = samples[: len(samples) // n * n].reshape(-1, n)
+    db = 20 * np.log10(np.maximum(np.sqrt((chunks ** 2).mean(axis=1)), 1e-5))
+    voiced = db[db > silence_db]
+    if voiced.size < 4:
+        return []
+    base = float(np.median(voiced))
+    events: list[dict] = []
+    for i, v in enumerate(db):
+        if v - base < over_db:
+            continue
+        t0, t1 = i * step, (i + 1) * step
+        if events and t0 - events[-1]["end"] <= 1.0:
+            events[-1]["end"] = t1
+            events[-1]["over_db"] = max(events[-1]["over_db"], round(float(v - base), 1))
+        else:
+            events.append({"start": t0, "end": t1, "over_db": round(float(v - base), 1)})
+    return events
+
+
 def transcript_text(tr: dict, offset: float = 0.0, limit_chars: int = 6000) -> str:
-    lines = [f"[{s['start'] - offset:.1f}] {s['text']}" for s in tr.get("segments", [])]
-    text = "\n".join(lines)
+    """Речь с таймкодами и вставленными метками криков (их Whisper не передаёт)."""
+    lines = [(s["start"] - offset, f"[{s['start'] - offset:.1f}] {s['text']}") for s in tr.get("segments", [])]
+    for e in tr.get("loud", []):
+        lines.append((e["start"] - offset, f"[{e['start'] - offset:.1f}] (КРИК: громче обычного на "
+                                           f"{e['over_db']:.0f} дБ, {e['end'] - e['start']:.1f} с)"))
+    lines.sort(key=lambda x: x[0])
+    text = "\n".join(line for _, line in lines)
     return text[:limit_chars] or "(речи нет)"
 
 

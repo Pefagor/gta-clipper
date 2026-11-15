@@ -28,6 +28,8 @@ detector:
   cooldown: 60
   thresholds: {low: 8.0, mid: 6.0, high: 4.5}   # чувствительность: меньше / средне / больше кандидатов
   weights: {chat: 2.0, audio: 1.5, emotes: 1.0}
+  rage_db: 9.0              # крик громче обычного уровня стримера на столько дБ — момент даже без реакции чата
+  rage_min_z: 2.5
   emotes: [KEKW, LUL, LULW, OMEGALUL, KEKL, ICANT, pepeLaugh, Pog, PogChamp, POGGERS, monkaS,
            WutFace, "💀", "😂", "🤣", "ахах", "хаха", "ору", "лол", "кек", "???", "клип", "clip"]
 

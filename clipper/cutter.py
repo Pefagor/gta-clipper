@@ -38,13 +38,15 @@ async def extract_audio(ffmpeg: str, raw: Path, wav: Path) -> None:
         raise CutError(f"ffmpeg audio: {out[-300:]}")
 
 
-async def extract_frames(ffmpeg: str, raw: Path, out_dir: Path, times: list[float], prefix: str) -> list[tuple[float, Path]]:
+async def extract_frames(ffmpeg: str, raw: Path, out_dir: Path, times: list[float], prefix: str,
+                         scale: int | None = 640, offset: float = 0.0) -> list[tuple[float, Path]]:
+    """Кадры в моменты times (+offset). scale=None — в исходном размере."""
     frames = []
+    vf = ["-vf", f"scale={scale}:-2"] if scale else []
     for i, t in enumerate(times):
         p = out_dir / f"{prefix}_{i:02d}.jpg"
-        code, _ = await run([ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-ss", f"{max(t, 0):.2f}",
-                             "-i", str(raw), "-frames:v", "1", "-vf", "scale=640:-2", "-q:v", "5", str(p)],
-                            timeout=60)
+        code, _ = await run([ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-ss", f"{max(t + offset, 0):.2f}",
+                             "-i", str(raw), "-frames:v", "1", *vf, "-q:v", "4", str(p)], timeout=60)
         if code == 0 and p.exists():
             frames.append((t, p))
     return frames
