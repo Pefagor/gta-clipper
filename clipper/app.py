@@ -189,7 +189,8 @@ class App:
                 self.offline_checks[login] = 0
                 if not rec and ch["state"] == "active":
                     await self._start_recording(login)
-                elif rec and rec.healthy and ch["cam_status"] == "unknown" and time.time() - rec.started_at > 60:
+                elif (rec and rec.healthy and ch["cam_status"] == "unknown" and time.time() - rec.started_at > 60
+                      and time.time() >= (self.db.kv_get(f"cam_next:{login}") or 0)):
                     self.db.update_channel(login, cam_status="pending")
                     self.spawn(self.calibrate_cam(login))
             else:
@@ -549,7 +550,8 @@ class App:
                 return
         except Exception:  # noqa: BLE001
             log.exception("[%s] поиск вебки", login)
-        # не получилось — попробуем снова на следующей проверке эфира
+        # не получилось — попробуем снова через 5 минут
+        self.db.kv_set(f"cam_next:{login}", time.time() + 300)
         ch = self.db.channel(login)
         if ch and ch["cam_status"] == "pending":
             self.db.update_channel(login, cam_status="unknown")
@@ -584,6 +586,10 @@ class App:
             res = {}
         if not res:
             log.warning("camcal: %s", out[-500:])
+            return False
+        if not res.get("rect"):
+            # лица нет (стример отошёл, заставка между играми) — не беспокоим, попробуем позже
+            log.info("[%s] вебка: лица в кадре нет, повторю через 5 минут", login)
             return False
         # последний кадр — основа для перерисовки рамки при ручной подстройке
         shutil.copy(frames[-1], work / "base.jpg")
