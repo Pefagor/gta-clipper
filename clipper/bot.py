@@ -67,6 +67,17 @@ def ago(ts: float | None) -> str:
     return f"{m} мин назад" if m < 60 else f"{m // 60} ч {m % 60} мин назад"
 
 
+def rating(c: dict) -> str:
+    """Оценка ИИ из 10, если она есть; иначе — балл всплеска детектора (у него нет верхней границы)."""
+    for key in ("review", "screen"):
+        res = c.get(key)
+        if isinstance(res, dict) and isinstance(res.get("score"), (int, float)):
+            return f"⭐ {int(res['score'])}/10"
+    if c["kind"] == "compilation":
+        return f"⭐ {int(c.get('score') or 0)}/10"
+    return f"📈 всплеск {c.get('score') or 0:.0f}"
+
+
 class BotUI:
     def __init__(self, app, token: str, owner_id: int | None):
         self.app = app
@@ -155,7 +166,7 @@ class BotUI:
         if c.get("spoiler"):
             lines.append("🔞 <b>СПОЙЛЕР</b>")
         who = c["channel"] if c["kind"] == "clip" else "подборка: " + c["channel"]
-        lines.append(f"📺 <b>{html.escape(who)}</b> · {CAT_ICON.get(cat, '🎬')} {html.escape(cat)} · ⭐ {int(c.get('score') or 0)}/10"
+        lines.append(f"📺 <b>{html.escape(who)}</b> · {CAT_ICON.get(cat, '🎬')} {html.escape(cat)} · {rating(c)}"
                      f" · 🕐 {ago(c.get('peak_ts') or c.get('created_at'))}")
         lines.append(f"«{html.escape(c.get('title') or '')}»")
         lines.append(f"⏱ {fmt_dur(c.get('render_duration'))} · В очереди ещё: {queue}")
