@@ -51,7 +51,7 @@ class PartIndexer:
         now = now or time.time()
         try:
             entries = parse_playlist(self.playlist.read_text(encoding="utf-8"))
-        except (FileNotFoundError, UnicodeDecodeError):
+        except (OSError, UnicodeDecodeError):  # на Windows файл может быть занят в момент переименования
             return []
         new = [(n, d) for n, d in entries if n not in self.seen and (self.part_dir / n).exists()]
         if not new:

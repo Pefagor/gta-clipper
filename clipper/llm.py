@@ -40,6 +40,34 @@ class LLMError(Exception):
     pass
 
 
+def as_bool(v, default: bool) -> bool:
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, str):
+        low = v.strip().lower()
+        if low in ("true", "yes", "да", "1"):
+            return True
+        if low in ("false", "no", "нет", "0"):
+            return False
+    if isinstance(v, (int, float)):
+        return bool(v)
+    return default
+
+
+def as_score(v) -> int:
+    m = re.search(r"\d+(?:\.\d+)?", str(v))
+    if not m:
+        raise LLMError(f"нет оценки в ответе: {v!r}")
+    return max(0, min(10, round(float(m.group()))))
+
+
+def as_float(v, default: float) -> float:
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return default
+
+
 def parse_json(text: str) -> dict:
     text = text.strip()
     m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.S)
@@ -108,24 +136,24 @@ class RouterAI:
 
     async def screen(self, context: str, frames) -> dict:
         res = await self.chat(self.cfg["screen_model"], SCREEN_SYSTEM, build_user_content(context, frames), 800)
-        res["score"] = int(float(res.get("score", 0)))
+        res["score"] = as_score(res.get("score"))
         if res.get("category") not in CATEGORIES:
             res["category"] = "другое"
         return res
 
     async def review(self, context: str, frames, duration: float) -> dict:
         res = await self.chat(self.cfg["review_model"], REVIEW_SYSTEM, build_user_content(context, frames), 2500)
-        start = max(0.0, float(res.get("start", 0)))
-        end = min(duration, float(res.get("end", duration)))
+        start = max(0.0, as_float(res.get("start"), 0.0))
+        end = min(duration, as_float(res.get("end"), duration))
         if end - start < 8:  # модель выдала странные границы — берём всё окно
             start, end = 0.0, duration
         if end - start > 90:
             end = start + 90
         titles = [str(t).strip() for t in (res.get("titles") or []) if str(t).strip()][:3] or ["Момент со стрима"]
-        return {"keep": bool(res.get("keep", True)), "score": int(float(res.get("score", 0))),
+        return {"keep": as_bool(res.get("keep"), True), "score": as_score(res.get("score", 0)),
                 "start": round(start, 2), "end": round(end, 2),
                 "category": res.get("category") if res.get("category") in CATEGORIES else "другое",
-                "spoiler": bool(res.get("spoiler", False)), "titles": titles,
+                "spoiler": as_bool(res.get("spoiler"), False), "titles": titles,
                 "tag": str(res.get("tag") or "").strip()[:40], "description": str(res.get("description") or "")[:200]}
 
     async def list_models(self) -> list[str]:

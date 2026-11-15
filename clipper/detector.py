@@ -6,6 +6,9 @@ from collections import deque
 from dataclasses import dataclass, field
 
 
+SILENCE_DB = -60.0
+
+
 @dataclass
 class Sample:
     t: float
@@ -62,6 +65,8 @@ class ChannelDetector:
             self.started_at = now
         chat_n, emote_n = count_recent(chat_history, now - win, now, c.get("emotes", []))
         audio_db = mean_audio(audio, now - 3, now)
+        if audio_db is not None and audio_db < SILENCE_DB:
+            audio_db = None  # тишина (BRB, выключенный микрофон) не участвует в сравнении
         base = [s for s in self.samples if now - c.get("baseline_seconds", 600) <= s.t <= now - win]
         self.samples.append(Sample(now, chat_n, emote_n, audio_db))
 
@@ -73,14 +78,17 @@ class ChannelDetector:
         base_chat = [s.chat for s in base]
         chat_z = zscore(chat_n, base_chat, min_std=max(1.0, statistics.fmean(base_chat) * 0.25))
         audio_vals = [s.audio for s in base if s.audio is not None]
-        audio_z = zscore(audio_db, audio_vals, min_std=2.0) if audio_db is not None and audio_vals else 0.0
+        audio_z = zscore(audio_db, audio_vals, min_std=3.0) if audio_db is not None and len(audio_vals) >= 15 else 0.0
+        if chat_n == 0:  # громкий звук без всякой реакции чата — не момент
+            audio_z = min(audio_z, 1.0)
         mean_chat = statistics.fmean(base_chat)
         emote_score = min(3.0, emote_n / max(4.0, mean_chat)) if chat_n else 0.0
-        clips = sum(1 for t in clip_moments if now - 40 <= t <= now)
+        # Клипы зрителей приходят из API с опозданием в минуты: в живой балл их не добавляем
+        # (они сами создают кандидатов в App._clips_loop), здесь только для информации.
+        clips = sum(1 for t in clip_moments if now - 300 <= t <= now)
 
         w = c.get("weights", {})
-        score = (w.get("clips", 3) * clips
-                 + w.get("chat", 2) * min(max(chat_z, 0), 5)
+        score = (w.get("chat", 2) * min(max(chat_z, 0), 5)
                  + w.get("audio", 1.5) * min(max(audio_z, 0), 5)
                  + w.get("emotes", 1) * emote_score)
         signals.update(chat_z=round(chat_z, 2), audio_z=round(audio_z, 2), emote_score=round(emote_score, 2),

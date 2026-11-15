@@ -12,7 +12,7 @@ recording:
   quality: best
   segment_seconds: 4
   buffer_hours: 3
-  stall_seconds: 30          # нет новых сегментов столько секунд -> перезапуск записи
+  stall_seconds: 240         # нет новых сегментов столько секунд -> перезапуск (рекламная пауза Twitch длится до 3 мин)
   live_check_seconds: 60
   streamlink_extra_args: ["--twitch-disable-ads"]
 
@@ -27,7 +27,7 @@ detector:
   max_window: 90
   cooldown: 60
   thresholds: {low: 8.0, mid: 6.0, high: 4.5}   # чувствительность: меньше / средне / больше кандидатов
-  weights: {clips: 3.0, chat: 2.0, audio: 1.5, emotes: 1.0}
+  weights: {chat: 2.0, audio: 1.5, emotes: 1.0}
   emotes: [KEKW, LUL, LULW, OMEGALUL, KEKL, ICANT, pepeLaugh, Pog, PogChamp, POGGERS, monkaS,
            WutFace, "💀", "😂", "🤣", "ахах", "хаха", "ору", "лол", "кек", "???", "клип", "clip"]
 

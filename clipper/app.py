@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import json
 import logging
 import shutil
@@ -43,7 +44,7 @@ class App:
         self.recorders: dict[str, Recorder] = {}
         self.detectors: dict[str, ChannelDetector] = {}
         self.open_windows: dict[str, OpenWindow] = {}
-        self.last_peak: dict[str, float] = {}
+        self.last_end: dict[str, float] = {}  # конец окна последнего кандидата канала
         self.clip_moments: dict[str, deque] = defaultdict(lambda: deque(maxlen=200))
         self.seen_clips: set[str] = set()
         self.offline_checks: dict[str, int] = defaultdict(int)
@@ -52,7 +53,11 @@ class App:
         self.bot = None  # BotUI, если задан токен Telegram
         self._alerted: dict[str, float] = {}
         self._tasks: list[asyncio.Task] = []
+        self._bg: set[asyncio.Task] = set()
+        self._started_at = time.time()
         (cfg.data_dir / "sessions").mkdir(exist_ok=True)
+        # сессии, оборванные падением или закрытием окна, считаем завершёнными — иначе уборка их не тронет
+        self.db.execute("UPDATE sessions SET ended_at=? WHERE ended_at IS NULL", (time.time(),))
         (cfg.data_dir / "candidates").mkdir(exist_ok=True)
         log.info("ffmpeg: %s · кодировщик: %s", self.ffmpeg, self.encoder)
 
@@ -71,7 +76,18 @@ class App:
         self._alerted[key] = now
         log.warning("ALERT %s", text)
         if self.bot:
-            await self.bot.notify("⚠️ " + text, buttons)
+            await self.bot.notify("⚠️ " + html.escape(text), buttons)
+
+    def spawn(self, coro) -> None:
+        """Фоновая задача с сохранённой ссылкой и логом ошибок."""
+        task = asyncio.create_task(coro)
+        self._bg.add(task)
+
+        def done(t: asyncio.Task):
+            self._bg.discard(t)
+            if not t.cancelled() and t.exception():
+                log.error("фоновая задача упала", exc_info=t.exception())
+        task.add_done_callback(done)
 
     def _on_usage(self, model: str, in_tok: int, out_tok: int, cost: float) -> None:
         self.db.add_spend(model, in_tok, out_tok, cost)
@@ -113,6 +129,9 @@ class App:
             self.db.update_channel(login, state="removing")
 
     async def set_paused(self, login: str, paused: bool) -> None:
+        ch = self.db.channel(login)
+        if ch and ch["state"] == "removing" and paused:  # пауза удаляемого канала = удалить сейчас
+            return await self.remove_channel(login, now=True)
         self.db.update_channel(login, state="paused" if paused else "active")
         if paused:
             await self._stop_recording(login)
@@ -162,13 +181,17 @@ class App:
         self.live = await self.twitch.live_logins(list(chans))
         for login, ch in chans.items():
             rec = self.recorders.get(login)
+            if rec and not rec.running:  # задача записи умерла — перезапускаем
+                log.warning("[%s] запись не работает, перезапускаю", login)
+                await self._stop_recording(login)
+                rec = None
             if login in self.live:
                 self.offline_checks[login] = 0
                 if not rec and ch["state"] == "active":
                     await self._start_recording(login)
                 elif rec and rec.healthy and ch["cam_status"] == "unknown" and time.time() - rec.started_at > 60:
                     self.db.update_channel(login, cam_status="pending")
-                    asyncio.create_task(self.calibrate_cam(login))
+                    self.spawn(self.calibrate_cam(login))
             else:
                 if ch["state"] == "removing" and not rec:
                     self.db.update_channel(login, state="removed", removed_at=time.time())
@@ -189,8 +212,8 @@ class App:
         self.recorders[login] = rec
         self.detectors[login] = ChannelDetector(self.cfg.section("detector"))
         self.chat.set_log(login, session_dir / "chat.jsonl")
-        await self.chat.join(login)
         rec.start()
+        await self.chat.join(login)
         log.info("[%s] запись начата: %s", login, session_dir)
 
     async def _stop_recording(self, login: str) -> None:
@@ -230,10 +253,12 @@ class App:
                     if score >= thr:
                         if win:
                             extend_window(win, now, dcfg)
+                            self.last_end[login] = win.end
                             win.max_score = max(win.max_score, score)
                             self.db.update_candidate(win.cid, win_end=win.end, score=win.max_score,
                                                      next_try_at=win.end + seg + 3)
-                        elif now - self.last_peak.get(login, 0) >= dcfg.get("cooldown", 60):
+                        elif now - dcfg.get("reaction_delay", 10) > self.last_end.get(login, 0) + 5:
+                            # новый момент — только после конца окна предыдущего, без дублей
                             self._new_candidate(login, rec, now - dcfg.get("reaction_delay", 10), score,
                                                 signals, "detector", track=True)
                     if win and now > win.end + seg + 3:
@@ -246,12 +271,12 @@ class App:
         dcfg = self.cfg.section("detector")
         seg = float(self.cfg.section("recording").get("segment_seconds", 4))
         start, end = plan_window(peak, dcfg)
-        start = max(start, rec.started_at)
+        start = max(start, rec.started_at, self.last_end.get(login, 0) if track else 0)
         cid = self.db.add_candidate(channel=login, session_id=rec.session_id, status="to_cut", trigger=trigger,
                                     peak_ts=peak, win_start=start, win_end=end, score=score, signals=signals,
                                     next_try_at=end + seg + 3)
-        self.last_peak[login] = peak
         if track:
+            self.last_end[login] = end
             self.open_windows[login] = OpenWindow(cid, peak, start, end, score)
         log.info("[%s] кандидат #%d (%s, балл %.1f)", login, cid, trigger, score)
         return cid
@@ -262,53 +287,79 @@ class App:
         while True:
             await asyncio.sleep(interval)
             for login, rec in list(self.recorders.items()):
-                ch = self.db.channel(login)
-                if not ch or not ch.get("user_id"):
-                    continue
                 try:
-                    clips = await self.twitch.recent_clips(ch["user_id"], time.time() - 900)
-                except Exception as e:  # noqa: BLE001
+                    await self._poll_clips(login, rec)
+                except Exception as e:  # noqa: BLE001 — ошибка одного канала не должна останавливать опрос
                     log.warning("клипы %s: %s", login, e)
-                    continue
-                for clip in clips:
-                    if clip["id"] in self.seen_clips:
-                        continue
-                    self.seen_clips.add(clip["id"])
-                    moment = parse_ts(clip["created_at"]) - 12
-                    if moment < rec.started_at:
-                        continue
-                    self.clip_moments[login].append(moment)
-                    hit = self.db.one("SELECT * FROM candidates WHERE channel=? AND kind='clip' AND win_start<=? "
-                                      "AND win_end>=? ORDER BY id DESC LIMIT 1", (login, moment, moment))
-                    if hit:
-                        sig = hit.get("signals") or {}
-                        sig["viewer_clips"] = int(sig.get("viewer_clips", 0)) + 1
-                        self.db.update_candidate(hit["id"], signals=sig)
-                    else:
-                        self._new_candidate(login, rec, moment, 3.0, {"viewer_clips": 1, "clip_title": clip.get("title")},
-                                            "viewer_clip", track=False)
+
+    async def _poll_clips(self, login: str, rec: Recorder) -> None:
+        ch = self.db.channel(login)
+        if not ch or not ch.get("user_id"):
+            return
+        for clip in await self.twitch.recent_clips(ch["user_id"], time.time() - 900):
+            if clip["id"] in self.seen_clips:
+                continue
+            self.seen_clips.add(clip["id"])
+            moment = parse_ts(clip["created_at"]) - 12
+            if moment < rec.started_at:
+                continue
+            self.clip_moments[login].append(moment)
+            hit = self.db.one("SELECT * FROM candidates WHERE channel=? AND kind='clip' AND win_start<=? "
+                              "AND win_end>=? ORDER BY id DESC LIMIT 1", (login, moment, moment))
+            if hit:
+                sig = hit.get("signals") or {}
+                sig["viewer_clips"] = int(sig.get("viewer_clips", 0)) + 1
+                self.db.update_candidate(hit["id"], signals=sig)
+            else:
+                self._new_candidate(login, rec, moment, 3.0, {"viewer_clips": 1, "clip_title": clip.get("title")},
+                                    "viewer_clip", track=False)
 
     # ---------- конвейер ----------
     async def _stage(self, status: str, fn, max_attempts: int = 3) -> None:
         while True:
-            c = self.db.next_candidate(status)
+            try:
+                c = self.db.next_candidate(status)
+            except Exception:  # noqa: BLE001
+                log.exception("очередь %s", status)
+                await asyncio.sleep(5)
+                continue
             if not c:
                 await asyncio.sleep(2)
                 continue
             try:
                 await fn(c)
             except Exception as e:  # noqa: BLE001
-                attempts = c["attempts"] + 1
-                log.warning("кандидат #%d (%s): %s", c["id"], status, e)
-                if attempts >= max_attempts or isinstance(e, CutError) and "нет сегментов" in str(e):
-                    self.db.update_candidate(c["id"], status="failed", error=str(e)[:500], attempts=attempts)
-                    await self.alert(f"fail:{status}", f"Кандидат #{c['id']} не обработан ({status}): {str(e)[:200]}")
-                else:
-                    self.db.update_candidate(c["id"], attempts=attempts, error=str(e)[:500],
-                                             next_try_at=time.time() + 30 * 2 ** (attempts - 1))
-                    if isinstance(e, LLMError) and attempts >= 3:
-                        await self.alert("llm", f"routerai не отвечает: {str(e)[:150]}",
-                                         [[("🔁 Повторить сейчас", "st:retry"), ("📊 Статус", "st:show")]])
+                try:
+                    await self._stage_failed(c, status, e, max_attempts)
+                except Exception:  # noqa: BLE001
+                    log.exception("обработка ошибки кандидата #%d", c["id"])
+                    await asyncio.sleep(5)
+
+    async def _stage_failed(self, c: dict, status: str, e: Exception, max_attempts: int) -> None:
+        attempts = c["attempts"] + 1
+        log.warning("кандидат #%d (%s): %s", c["id"], status, e)
+        permanent = isinstance(e, CutError) and e.permanent
+        if attempts >= max_attempts or permanent:
+            old = c.get("render_path")
+            if status == "to_render" and old and Path(old).exists():
+                # неудачный перерендер: возвращаем прежний готовый клип на модерацию
+                self.db.update_candidate(c["id"], status="rendered", edit_start=None, edit_end=None,
+                                         card_msg_id=None, attempts=0, error=str(e)[:500])
+                await self.alert(f"rerender:{c['id']}", f"Перерендер клипа #{c['id']} не удался, "
+                                                        f"оставил прежнюю версию: {str(e)[:200]}")
+                return
+            self.db.update_candidate(c["id"], status="failed", error=str(e)[:500], attempts=attempts)
+            if c["kind"] == "compilation":
+                self.release_parts(c)
+            if not permanent:
+                await self.alert(f"fail:{status}",
+                                 f"Кандидат #{c['id']} не обработан ({status}): {str(e)[:200]}")
+        else:
+            self.db.update_candidate(c["id"], attempts=attempts, error=str(e)[:500],
+                                     next_try_at=time.time() + 30 * 2 ** (attempts - 1))
+            if isinstance(e, LLMError) and attempts >= 3:
+                await self.alert("llm", f"routerai не отвечает: {str(e)[:150]}",
+                                 [[("🔁 Повторить сейчас", "st:retry"), ("📊 Статус", "st:show")]])
 
     def cand_dir(self, c: dict) -> Path:
         return Path(c["dir"]) if c.get("dir") else self.cfg.data_dir / "candidates" / f"{c['id']:06d}_{c['channel']}"
@@ -319,7 +370,7 @@ class App:
         raw, raw_start, dur = await cut_candidate(self.ffmpeg, Path(sess["dir"]), out_dir,
                                                   c["win_start"], c["win_end"], c["peak_ts"])
         if dur < 8:
-            raise CutError(f"слишком короткий кусок записи ({dur:.0f} с)")
+            raise CutError(f"слишком короткий кусок записи ({dur:.0f} с)", permanent=True)
         self.db.update_candidate(c["id"], status="cut", dir=str(out_dir), raw_start_ts=raw_start,
                                  raw_duration=dur, attempts=0, error=None)
 
@@ -332,13 +383,13 @@ class App:
         wav.unlink(missing_ok=True)
         self.db.update_candidate(c["id"], status="transcribed", attempts=0, error=None)
 
-    def _context(self, c: dict, screen: dict | None = None) -> str:
+    async def _context(self, c: dict, screen: dict | None = None) -> str:
         d = Path(c["dir"])
         tr = json.loads((d / "transcript.json").read_text(encoding="utf-8"))
         t0, dur = c["raw_start_ts"], c["raw_duration"]
         chat = [(t - t0, m) for t, m in self.chat.window(c["channel"], t0, t0 + dur)]
-        if not chat:  # после перезапуска программы — читаем из лога сессии
-            chat = self._chat_from_log(c, t0, dur)
+        if not chat and t0 < self._started_at:  # окно до перезапуска программы — читаем лог сессии
+            chat = await asyncio.to_thread(self._chat_from_log, c, t0, dur)
         return build_context(c["channel"], transcript_text(tr), chat, c.get("signals") or {},
                              c["peak_ts"] - t0, dur, screen)
 
@@ -376,7 +427,7 @@ class App:
         d = Path(c["dir"])
         peak_rel = c["peak_ts"] - c["raw_start_ts"]
         frames = await extract_frames(self.ffmpeg, d / "raw.mp4", d, spread(c["raw_duration"], 3, peak_rel, 30), "s")
-        res = await self.llm.screen(self._context(c), frames)
+        res = await self.llm.screen(await self._context(c), frames)
         thr = int(self.cfg.section("llm").get("screen_threshold", 6))
         status = "screened" if res["score"] >= thr else "discarded"
         self.db.update_candidate(c["id"], status=status, screen=res, category=res["category"], attempts=0, error=None)
@@ -386,7 +437,7 @@ class App:
             return
         d = Path(c["dir"])
         frames = await extract_frames(self.ffmpeg, d / "raw.mp4", d, spread(c["raw_duration"], 6), "r")
-        res = await self.llm.review(self._context(c, c.get("screen")), frames, c["raw_duration"])
+        res = await self.llm.review(await self._context(c, c.get("screen")), frames, c["raw_duration"])
         if not res["keep"]:
             self.db.update_candidate(c["id"], status="discarded", review=res)
             return
@@ -444,10 +495,18 @@ class App:
             self.db.update_candidate(r["id"], in_compilation=1)
         return cid
 
+    def release_parts(self, c: dict) -> None:
+        """Подборка не состоялась — её клипы снова доступны для других подборок."""
+        for i in c.get("parts") or []:
+            self.db.update_candidate(i, in_compilation=0)
+
     async def _render_compilation(self, c: dict) -> None:
-        parts = [self.db.candidate(i) for i in c["parts"]]
-        paths = [Path(p["render_path"]) for p in parts if p and p.get("render_path")]
-        total = sum(p.get("render_duration") or 0 for p in parts if p)
+        parts = [p for p in (self.db.candidate(i) for i in c["parts"])
+                 if p and p.get("render_path") and Path(p["render_path"]).exists()]
+        if len(parts) < 2:
+            raise CutError("клипы для подборки уже удалены", permanent=True)
+        paths = [Path(p["render_path"]) for p in parts]
+        total = sum(p.get("render_duration") or 0 for p in parts)
         d = self.cand_dir(c)
         d.mkdir(parents=True, exist_ok=True)
         out = d / "clip.mp4"
@@ -457,12 +516,23 @@ class App:
 
     # ---------- вебка ----------
     async def calibrate_cam(self, login: str) -> None:
+        try:
+            if await self._calibrate_cam(login):
+                return
+        except Exception:  # noqa: BLE001
+            log.exception("[%s] поиск вебки", login)
+        # не получилось — попробуем снова на следующей проверке эфира
+        ch = self.db.channel(login)
+        if ch and ch["cam_status"] == "pending":
+            self.db.update_channel(login, cam_status="unknown")
+
+    async def _calibrate_cam(self, login: str) -> bool:
         rec = self.recorders.get(login)
         if not rec:
-            return
-        segs = load_session_segments(rec.session_dir)[-40:]
+            return False
+        segs = (await asyncio.to_thread(load_session_segments, rec.session_dir))[-40:]
         if not segs:
-            return
+            return False
         picks = [segs[int(i * (len(segs) - 1) / 5)] for i in range(6)]
         work = self.cfg.data_dir / "cam" / login
         work.mkdir(parents=True, exist_ok=True)
@@ -474,7 +544,7 @@ class App:
             if code == 0 and p.exists():
                 frames.append(str(p))
         if not frames:
-            return
+            return False
         preview = work / "preview.jpg"
         code, out = await run([sys.executable, "-m", "clipper.camcal", str(preview), *frames], timeout=120)
         rect = None
@@ -487,6 +557,7 @@ class App:
             await self.bot.send_cam_proposal(login, preview if preview.exists() else None, rect)
         else:  # без бота принимаем как есть
             self.accept_cam(login, rect)
+        return True
 
     def accept_cam(self, login: str, rect) -> None:
         if rect:
@@ -500,7 +571,7 @@ class App:
         cl = self.cfg.section("cleanup")
         while True:
             try:
-                self._cleanup(cl)
+                await asyncio.to_thread(self._cleanup, cl)  # rmtree тысяч файлов не должен тормозить запись
                 free = shutil.disk_usage(self.cfg.data_dir).free / 1e9
                 if free < float(cl.get("min_free_gb", 20)):
                     await self.alert("disk", f"На диске осталось {free:.0f} ГБ", every=3600)
@@ -526,6 +597,21 @@ class App:
             if not busy and Path(s["dir"]).exists():
                 for part in Path(s["dir"]).glob("part_*"):
                     shutil.rmtree(part, ignore_errors=True)
+        # идущие сессии: старые части (после переподключений) ffmpeg сам не чистит
+        for rec in list(self.recorders.values()):
+            current = rec.session_dir / f"part_{rec.part:03d}"
+            for part in rec.session_dir.glob("part_*"):
+                seg_log = part / "segments.jsonl"
+                last = seg_log.stat().st_mtime if seg_log.exists() else part.stat().st_mtime
+                if part != current and last < now - buf - 600:
+                    shutil.rmtree(part, ignore_errors=True)
+            # сегменты текущей части, которые ffmpeg не смог удалить (файл был занят на Windows)
+            for seg in current.glob("seg_*.ts"):
+                try:
+                    if seg.stat().st_mtime < now - buf - 1800:
+                        seg.unlink()
+                except OSError:
+                    pass
 
     # ---------- статус ----------
     def status(self) -> dict:

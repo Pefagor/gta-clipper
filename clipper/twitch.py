@@ -73,9 +73,16 @@ class TwitchAPI:
             proc = await asyncio.create_subprocess_exec(
                 self.streamlink, "--json", f"https://twitch.tv/{login}",
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+        except OSError:
+            return False
+        try:
             out, _ = await asyncio.wait_for(proc.communicate(), 40)
             return bool(json.loads(out or b"{}").get("streams"))
-        except (asyncio.TimeoutError, ValueError, OSError):
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            return False
+        except ValueError:
             return False
 
     async def recent_clips(self, broadcaster_id: str, since: float) -> list[dict]:

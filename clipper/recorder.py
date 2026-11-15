@@ -46,12 +46,12 @@ class Recorder:
     async def stop(self) -> None:
         self.stop_requested = True
         await self._kill()
-        if self._task:
-            self._task.cancel()
-            try:
-                await self._task
-            except (asyncio.CancelledError, Exception):
-                pass
+        if self._task and not self._task.done():
+            try:  # даём задаче корректно закрыть логи и дописать индекс
+                await asyncio.wait_for(asyncio.shield(self._task), 20)
+            except (asyncio.TimeoutError, asyncio.CancelledError, Exception):  # noqa: BLE001
+                self._task.cancel()
+        self.healthy = False
 
     @property
     def running(self) -> bool:
@@ -63,16 +63,25 @@ class Recorder:
         while not self.stop_requested:
             self.part += 1
             part_dir = self.session_dir / f"part_{self.part:03d}"
-            part_dir.mkdir(parents=True, exist_ok=True)
             t0 = time.time()
-            reason = await self._run_part(part_dir)
+            try:
+                part_dir.mkdir(parents=True, exist_ok=True)
+                reason = await self._run_part(part_dir)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001 — запись не должна умирать молча
+                log.exception("[%s] ошибка записи", self.login)
+                reason = f"ошибка: {e}"
             if self.stop_requested:
                 break
             self.healthy = False
             self.restarts += 1
             log.warning("[%s] запись прервалась (%s), перезапуск через %d с", self.login, reason, backoff)
             if self.on_alert and self.restarts % 3 == 0:
-                await self.on_alert(self.login, reason)
+                try:
+                    await self.on_alert(self.login, reason)
+                except Exception:  # noqa: BLE001
+                    log.exception("уведомление о записи")
             await asyncio.sleep(backoff)
             backoff = 5 if time.time() - t0 > 300 else min(backoff * 2, 60)
 
@@ -118,11 +127,13 @@ class Recorder:
                     reason = f"нет новых сегментов {int(stall)} с"
                     break
         finally:
-            await self._kill()
-            audio_task.cancel()
-            indexer.poll()
-            sl_log.close()
-            ff_log.close()
+            try:
+                await self._kill()
+            finally:
+                audio_task.cancel()
+                indexer.poll()
+                sl_log.close()
+                ff_log.close()
         return reason
 
     async def _read_audio(self, stream: asyncio.StreamReader) -> None:

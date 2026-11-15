@@ -68,9 +68,14 @@ class ChatHub:
         self._joined.discard(login)
 
     async def _send(self, line: str) -> None:
-        if self._writer:
+        if not self._writer:
+            return
+        try:
             self._writer.write((line + "\r\n").encode("utf-8"))
             await self._writer.drain()
+        except (OSError, RuntimeError) as e:  # соединение умерло — run() переподключится и сделает JOIN заново
+            log.warning("чат: ошибка отправки (%s)", e)
+            self._writer.close()
 
     async def run(self) -> None:
         backoff = 2

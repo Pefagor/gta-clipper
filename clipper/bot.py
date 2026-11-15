@@ -10,7 +10,8 @@ from pathlib import Path
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.client.session.aiohttp import AiohttpSession
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.filters import BaseFilter, Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -71,11 +72,26 @@ class BotUI:
         self.app = app
         self.db = app.db
         self.owner_id = owner_id
-        self.bot = Bot(token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+        # большой таймаут: клип до 45 МБ грузится долго, а повтор по таймауту отправил бы видео дважды
+        self.bot = Bot(token, session=AiohttpSession(timeout=600),
+                       default=DefaultBotProperties(parse_mode=ParseMode.HTML))
         self.dp = Dispatcher()
         self.router = Router()
         self._card_lock = asyncio.Lock()
+        self._pub_lock = asyncio.Lock()
+        self._bg: set[asyncio.Task] = set()
         self._register()
+
+    def spawn(self, coro) -> None:
+        """Фоновая задача с сохранённой ссылкой и логом ошибок."""
+        task = asyncio.create_task(coro)
+        self._bg.add(task)
+
+        def done(t: asyncio.Task):
+            self._bg.discard(t)
+            if not t.cancelled() and t.exception():
+                log.error("фоновая задача упала", exc_info=t.exception())
+        task.add_done_callback(done)
 
     # ================= запуск =================
     async def run(self) -> None:
@@ -139,7 +155,7 @@ class BotUI:
         if c.get("spoiler"):
             lines.append("🔞 <b>СПОЙЛЕР</b>")
         who = c["channel"] if c["kind"] == "clip" else "подборка: " + c["channel"]
-        lines.append(f"📺 <b>{html.escape(who)}</b> · {CAT_ICON.get(cat, '🎬')} {cat} · ⭐ {int(c.get('score') or 0)}/10"
+        lines.append(f"📺 <b>{html.escape(who)}</b> · {CAT_ICON.get(cat, '🎬')} {html.escape(cat)} · ⭐ {int(c.get('score') or 0)}/10"
                      f" · 🕐 {ago(c.get('peak_ts') or c.get('created_at'))}")
         lines.append(f"«{html.escape(c.get('title') or '')}»")
         lines.append(f"⏱ {fmt_dur(c.get('render_duration'))} · В очереди ещё: {queue}")
@@ -149,11 +165,26 @@ class BotUI:
         return kb([[("✅ Одобрить", f"m:ok:{cid}"), ("❌ Отклонить", f"m:no:{cid}")],
                    [("✂️ Обрезать", f"m:cut:{cid}"), ("📝 Заголовок", f"m:title:{cid}")]])
 
-    async def _send_card(self, c: dict) -> None:
-        msg = await self.bot.send_video(self.owner_id, FSInputFile(c["render_path"]), caption=self._card_caption(c),
-                                        reply_markup=self._card_kb(c["id"]), supports_streaming=True,
-                                        width=1080, height=1920, disable_notification=self.quiet)
+    async def _send_card(self, c: dict) -> bool:
+        """Отправляет карточку. False — клип отправить нельзя (он помечен failed), нужно брать следующий."""
+        path = c.get("render_path")
+        if not path or not Path(path).exists():
+            self.db.update_candidate(c["id"], status="failed", error="файл клипа пропал")
+            return False
+        try:
+            msg = await self.bot.send_video(self.owner_id, FSInputFile(path), caption=self._card_caption(c)[:1024],
+                                            reply_markup=self._card_kb(c["id"]), supports_streaming=True,
+                                            width=1080, height=1920, disable_notification=self.quiet)
+        except TelegramForbiddenError:
+            log.warning("Telegram не даёт писать: откройте бота и нажмите /start")
+            await asyncio.sleep(60)
+            return True
+        except TelegramBadRequest as e:
+            self.db.update_candidate(c["id"], status="failed", error=f"telegram: {e}"[:500])
+            await self.notify(f"⚠️ Клип #{c['id']} не отправился в Telegram: {html.escape(str(e)[:200])}")
+            return False
         self.db.update_candidate(c["id"], card_msg_id=msg.message_id)
+        return True
 
     async def _card_loop(self) -> None:
         while True:
@@ -166,27 +197,41 @@ class BotUI:
             except Exception:  # noqa: BLE001
                 log.exception("карточка модерации")
 
-    async def _ensure_card(self, resend: bool = False) -> None:
-        cur_id = self.db.kv_get("card_id")
-        cur = self.db.candidate(cur_id) if cur_id else None
-        if cur and cur["status"] == "to_render":
-            return  # перерендер после обрезки — ждём
-        if cur and cur["status"] == "rendered":
-            if not cur.get("card_msg_id") or resend:
-                await self._send_card(cur)
-            return
-        nxt = self.db.one("SELECT * FROM candidates WHERE status='rendered' ORDER BY id LIMIT 1")
-        self.db.kv_set("card_id", nxt["id"] if nxt else None)
-        if nxt:
-            await self._send_card(nxt)
+    async def _ensure_card(self, resend: bool = False) -> str:
+        """Следит, чтобы на экране была ровно одна карточка. Возвращает, что сейчас происходит."""
+        for _ in range(20):  # пропускаем клипы, которые отправить нельзя
+            cur_id = self.db.kv_get("card_id")
+            cur = self.db.candidate(cur_id) if cur_id else None
+            if cur and cur["status"] == "to_render":
+                return "rerender"  # перерендер после обрезки или смены заголовка — ждём
+            if cur and cur["status"] == "rendered":
+                if cur.get("card_msg_id") and not resend:
+                    return "shown"
+                if cur.get("card_msg_id"):  # старая копия карточки больше не активна
+                    await self._safe(self.bot.edit_message_reply_markup(chat_id=self.owner_id,
+                                                                        message_id=cur["card_msg_id"],
+                                                                        reply_markup=None))
+                if await self._send_card(cur):
+                    return "shown"
+                continue
+            nxt = self.db.one("SELECT * FROM candidates WHERE status='rendered' ORDER BY id LIMIT 1")
+            self.db.kv_set("card_id", nxt["id"] if nxt else None)
+            if not nxt:
+                return "empty"
+            resend = False
+        return "empty"
 
     async def on_mod(self, m: Message, state: FSMContext):
         await state.clear()
-        if not self.db.count("rendered") and not self.db.count("to_render"):
-            await m.answer("Очередь модерации пуста. Новые клипы придут сами.", reply_markup=MAIN_KB)
-            return
         async with self._card_lock:
-            await self._ensure_card(resend=True)
+            result = await self._ensure_card(resend=True)
+        if result == "rerender":
+            await m.answer("Клип перерендеривается, карточка придёт через несколько секунд.", reply_markup=MAIN_KB)
+        elif result == "empty":
+            busy = self.db.scalar("SELECT COUNT(*) FROM candidates WHERE status IN "
+                                  "('to_cut','cut','transcribed','screened','to_render')") or 0
+            await m.answer("Очередь модерации пуста." + (f" В обработке: {busy}." if busy else "")
+                           + " Новые клипы придут сами.", reply_markup=MAIN_KB)
 
     async def _decide(self, q: CallbackQuery, cid: int, ok: bool) -> None:
         c = self.db.candidate(cid)
@@ -194,6 +239,8 @@ class BotUI:
             await q.answer("Этот клип уже обработан")
             return
         self.db.update_candidate(cid, status="approved" if ok else "rejected", decided_at=time.time())
+        if not ok and c["kind"] == "compilation":
+            self.app.release_parts(c)
         text = self._card_caption(c) + ("\n\n✅ <b>Одобрено</b>" if ok else "\n\n❌ <b>Отклонено</b>")
         markup = None if ok else kb([[("↩️ Вернуть", f"m:undo:{cid}")]])
         await self._safe(q.message.edit_caption(caption=text, reply_markup=markup))
@@ -205,6 +252,8 @@ class BotUI:
 
     # ================= обработчик кнопок =================
     async def cb(self, q: CallbackQuery, state: FSMContext):
+        if not isinstance(q.message, Message):  # сообщение слишком старое, Telegram его не отдаёт
+            return await self._safe(q.answer("Сообщение устарело, откройте раздел заново из меню"))
         parts = q.data.split(":")
         kind, action = parts[0], parts[1] if len(parts) > 1 else ""
         arg = parts[2] if len(parts) > 2 else ""
@@ -217,6 +266,9 @@ class BotUI:
         except TelegramBadRequest as e:
             log.debug("telegram: %s", e)
             await self._safe(q.answer())
+        except Exception:  # noqa: BLE001 — ошибка в одной кнопке не должна ронять бота
+            log.exception("кнопка %s", q.data)
+            await self._safe(q.answer("Ошибка, подробности в логе"))
 
     async def cb_m(self, q, state, action, arg, parts):
         cid = int(arg)
@@ -226,8 +278,8 @@ class BotUI:
         if not c:
             return await q.answer("Клип не найден")
         if action == "undo":
-            if c["status"] != "rejected":
-                return await q.answer("Уже нельзя вернуть")
+            if c["status"] != "rejected" or not c.get("render_path") or not Path(c["render_path"]).exists():
+                return await q.answer("Уже нельзя вернуть: клип удалён", show_alert=True)
             self.db.update_candidate(cid, status="rendered", card_msg_id=None, decided_at=None)
             await self._safe(q.message.edit_caption(caption=self._card_caption(c) + "\n\n↩️ Возвращён в очередь",
                                                     reply_markup=None))
@@ -267,8 +319,9 @@ class BotUI:
             await self._safe(q.message.edit_reply_markup(reply_markup=self._cut_kb(self.db.candidate(cid))))
             return await q.answer()
         if what == "go":
-            self.db.update_candidate(cid, status="to_render", card_msg_id=None)
-            self.db.kv_set("card_id", cid)
+            async with self._card_lock:
+                self.db.update_candidate(cid, status="to_render", card_msg_id=None)
+                self.db.kv_set("card_id", cid)
             await self._safe(q.message.delete())
             return await q.answer("Перерендериваю, ~15 с")
         if what == "back":
@@ -291,21 +344,23 @@ class BotUI:
             return await q.answer()
         titles = c.get("titles") or []
         idx = int(arg)
-        if idx < len(titles):
-            await self._set_title(cid, titles[idx])
-            await self._safe(q.message.delete())
-            await q.answer("Заголовок выбран, перерендериваю")
+        if c["status"] != "rendered" or idx >= len(titles):
+            return await q.answer("Клип уже обработан")
+        await self._safe(q.message.delete())
+        await self._set_title(cid, titles[idx])
+        await q.answer("Заголовок выбран, перерендериваю")
 
-    async def _set_title(self, cid: int, title: str) -> None:
-        """Карточку перед вызовом удаляют; она придёт заново с новым заголовком."""
-        c = self.db.candidate(cid)
-        if not c:
-            return
-        self.db.update_candidate(cid, title=title, card_msg_id=None)
-        if c["status"] == "rendered":
+    async def _set_title(self, cid: int, title: str) -> bool:
+        """Только для клипа на модерации. Карточку перед вызовом удаляют; она придёт заново."""
+        async with self._card_lock:
+            c = self.db.candidate(cid)
+            if not c or c["status"] != "rendered":
+                return False
+            self.db.update_candidate(cid, title=title, card_msg_id=None)
             self.db.kv_set("card_id", cid)
             if c["kind"] == "clip":  # заголовок вшит в видео — перерендер
                 self.db.update_candidate(cid, status="to_render", edit_start=c["clip_start"], edit_end=c["clip_end"])
+            return True
 
     async def in_title(self, m: Message, state: FSMContext):
         data = await state.get_data()
@@ -315,19 +370,21 @@ class BotUI:
             return await m.answer("Пустой заголовок, оставил как было.")
         cid = data.get("cid")
         c = self.db.candidate(cid) if cid else None
-        if c and c.get("card_msg_id"):
+        if not c or c["status"] != "rendered":
+            return await m.answer("Этот клип уже обработан, заголовок не изменён.", reply_markup=MAIN_KB)
+        if c.get("card_msg_id"):
             await self._safe(self.bot.delete_message(self.owner_id, c["card_msg_id"]))
         await self._set_title(cid, title)
         await m.answer(f"Заголовок: «{html.escape(title)}». Перерендериваю.", reply_markup=MAIN_KB)
 
     # ================= публикация =================
     def _pkg_caption(self, c: dict) -> str:
-        tags = self.app.setting("hashtags") or ""
-        title = c.get("title") or "Момент со стрима"
+        tags = (self.app.setting("hashtags") or "")[:200]
+        title = (c.get("title") or "Момент со стрима")[:90]
         if c["kind"] == "clip":
             credit = f"Стрим: twitch.tv/{c['channel']}"
         else:
-            credit = c.get("description") or ""
+            credit = (c.get("description") or "")[:250]
         shorts_t = f"{title} | GTA 6"[:100]
         shorts_d = f"{credit} {tags} #shorts".strip()
         tiktok = f"{title} {credit} {tags}".strip()
@@ -348,15 +405,30 @@ class BotUI:
                     ("✅ Выложил в TikTok" if not c.get("pub_tiktok") else "☑️ TikTok", f"p:t:{cid}")],
                    [("⏰ Через 1 час", f"p:later:{cid}"), ("🗑 Не публиковать", f"p:drop:{cid}")]])
 
-    async def _send_package(self, c: dict) -> None:
-        path = c.get("render_path")
-        if not path or not Path(path).exists():
-            self.db.update_candidate(c["id"], status="failed", error="файл клипа пропал")
-            return
-        msg = await self.bot.send_video(self.owner_id, FSInputFile(path), caption=self._pkg_caption(c),
-                                        reply_markup=self._pkg_kb(c), supports_streaming=True, width=1080,
-                                        height=1920, disable_notification=self.quiet)
-        self.db.update_candidate(c["id"], status="sent", sent_at=time.time(), pkg_msg_id=msg.message_id)
+    async def _send_package(self, cid: int) -> bool:
+        """Отправляет пакет, если клип всё ещё ждёт публикации. Под замком — без двойной отправки."""
+        async with self._pub_lock:
+            c = self.db.candidate(cid)
+            if not c or c["status"] != "approved":
+                return False
+            path = c.get("render_path")
+            if not path or not Path(path).exists():
+                self.db.update_candidate(cid, status="failed", error="файл клипа пропал")
+                return False
+            try:
+                msg = await self.bot.send_video(self.owner_id, FSInputFile(path), caption=self._pkg_caption(c)[:1024],
+                                                reply_markup=self._pkg_kb(c), supports_streaming=True, width=1080,
+                                                height=1920, disable_notification=self.quiet)
+            except TelegramForbiddenError:
+                log.warning("Telegram не даёт писать: откройте бота и нажмите /start")
+                self.db.update_candidate(cid, defer_until=time.time() + 300)
+                return False
+            except TelegramBadRequest as e:
+                self.db.update_candidate(cid, status="failed", error=f"telegram: {e}"[:500])
+                await self.notify(f"⚠️ Пакет клипа #{cid} не отправился: {html.escape(str(e)[:200])}")
+                return False
+            self.db.update_candidate(cid, status="sent", sent_at=time.time(), pkg_msg_id=msg.message_id)
+            return True
 
     def _next_publish_at(self) -> float:
         interval = float(self.app.setting("interval_hours") or 1.5) * 3600
@@ -380,9 +452,9 @@ class BotUI:
                 if not c:
                     continue
                 if self.app.setting("publish_mode") == "now":
-                    await self._send_package(c)
+                    await self._send_package(c["id"])
                 elif self._sent_today() < int(self.app.setting("per_day") or 10) and time.time() >= self._next_publish_at():
-                    await self._send_package(c)
+                    await self._send_package(c["id"])
             except Exception:  # noqa: BLE001
                 log.exception("публикация")
 
@@ -391,8 +463,9 @@ class BotUI:
             c = self._next_approved()
             if not c:
                 return await q.answer("Нет одобренных клипов в очереди")
-            await self._send_package(c)
-            return await q.answer()
+            await q.answer("Отправляю")
+            await self._send_package(c["id"])
+            return
         if action == "comp":
             tags = self.app.compilation_tags()
             if not tags:
@@ -431,7 +504,7 @@ class BotUI:
                 await self._safe(q.message.edit_caption(caption=self._pkg_caption(c), reply_markup=self._pkg_kb(c)))
             return await q.answer()
         if action == "later":
-            self.db.update_candidate(cid, status="approved", defer_until=time.time() + 3600, sent_at=None)
+            self.db.update_candidate(cid, status="approved", defer_until=time.time() + 3600)
             await self._safe(q.message.delete())
             return await q.answer("Пришлю снова через час")
         if action == "drop":
@@ -524,7 +597,7 @@ class BotUI:
             if login not in self.app.recorders:
                 return await q.answer("Настроить вебку можно, когда канал в эфире", show_alert=True)
             self.db.update_channel(login, cam_status="pending")
-            asyncio.create_task(self.app.calibrate_cam(login))
+            self.spawn(self.app.calibrate_cam(login))
             return await q.answer("Ищу вебку, пришлю кадр")
         elif action == "del":
             name = html.escape((self.db.channel(login) or {}).get("display_name") or login)
@@ -587,7 +660,7 @@ class BotUI:
             if login not in self.app.recorders:
                 return await q.answer("Канал сейчас не в эфире", show_alert=True)
             await self._safe(q.message.delete())
-            asyncio.create_task(self.app.calibrate_cam(login))
+            self.spawn(self.app.calibrate_cam(login))
             return await q.answer("Ищу снова")
         await self._safe(q.answer())
 
@@ -687,7 +760,7 @@ class BotUI:
 
     async def in_hashtags(self, m: Message, state: FSMContext):
         await state.clear()
-        tags = " ".join(t if t.startswith("#") else f"#{t}" for t in (m.text or "").split())
+        tags = " ".join(t if t.startswith("#") else f"#{t}" for t in (m.text or "").split())[:200]
         self.app.set_setting("hashtags", tags)
         await m.answer(f"Хэштеги: {html.escape(tags) or '—'}", reply_markup=MAIN_KB)
 

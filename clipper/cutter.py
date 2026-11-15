@@ -8,7 +8,9 @@ from .tools import run
 
 
 class CutError(Exception):
-    pass
+    def __init__(self, msg: str, permanent: bool = False):
+        super().__init__(msg)
+        self.permanent = permanent  # повтор не поможет
 
 
 async def cut_candidate(ffmpeg: str, session_dir: Path, out_dir: Path, start: float, end: float,
@@ -16,10 +18,11 @@ async def cut_candidate(ffmpeg: str, session_dir: Path, out_dir: Path, start: fl
     """Склеивает сегменты окна в raw.mp4. Возвращает (путь, время начала, длительность)."""
     segs = pick_window(load_session_segments(session_dir), start, end, anchor)
     if not segs:
-        raise CutError("нет сегментов для этого окна (запись удалена или ещё не началась)")
+        raise CutError("нет сегментов для этого окна (запись удалена или ещё не началась)", permanent=True)
     out_dir.mkdir(parents=True, exist_ok=True)
     lst = out_dir / "concat.txt"
-    lst.write_text("".join(f"file '{s.path.as_posix()}'\n" for s in segs), encoding="utf-8")
+    esc = lambda p: p.as_posix().replace("'", "'\\''")  # noqa: E731
+    lst.write_text("".join(f"file '{esc(s.path)}'\n" for s in segs), encoding="utf-8")
     raw = out_dir / "raw.mp4"
     code, out = await run([ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-f", "concat", "-safe", "0",
                            "-i", str(lst), "-c", "copy", "-movflags", "+faststart", str(raw)], timeout=120)
