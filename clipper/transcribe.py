@@ -66,8 +66,10 @@ class Transcriber:
             raise RuntimeError(f"не удалось запустить whisper: {last}")
 
     def _run(self, wav: Path) -> dict:
+        # WAV (16 кГц моно, его готовит ffmpeg) читаем сами: декодер faster-whisper через PyAV
+        # ломается на несовпадающих версиях PyAV.
         segments, info = self._model.transcribe(
-            str(wav), language=self.cfg.get("language", "ru"), word_timestamps=True,
+            read_wav(wav), language=self.cfg.get("language", "ru"), word_timestamps=True,
             vad_filter=True, beam_size=int(self.cfg.get("beam_size", 5)))
         out = []
         for s in segments:
@@ -75,6 +77,17 @@ class Transcriber:
                      for w in (s.words or []) if w.word.strip()]
             out.append({"start": round(s.start, 2), "end": round(s.end, 2), "text": s.text.strip(), "words": words})
         return {"language": info.language, "segments": out}
+
+
+def read_wav(path: Path):
+    import wave
+
+    import numpy as np
+    with wave.open(str(path), "rb") as w:
+        if w.getsampwidth() != 2 or w.getnchannels() != 1 or w.getframerate() != 16000:
+            raise ValueError(f"ожидался WAV 16 кГц моно 16 бит: {path}")
+        data = w.readframes(w.getnframes())
+    return np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
 
 
 def _device_error(e: Exception) -> bool:

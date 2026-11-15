@@ -93,7 +93,7 @@ class Recorder:
         ff_log = open(part_dir / "ffmpeg.log", "ab")
         try:
             streamlink = await asyncio.create_subprocess_exec(
-                self.cfg.get("streamlink", "streamlink"), *self.rec.get("streamlink_extra_args", []),
+                self.cfg.get("streamlink", "streamlink"), *(self.rec.get("streamlink_extra_args") or []),
                 "--loglevel", "warning", "-O", f"https://twitch.tv/{self.login}", self.rec.get("quality", "best"),
                 stdout=w_fd, stderr=sl_log)
             ffmpeg = await asyncio.create_subprocess_exec(

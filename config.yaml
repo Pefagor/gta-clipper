@@ -14,7 +14,7 @@ recording:
   buffer_hours: 3
   stall_seconds: 240         # нет новых сегментов столько секунд -> перезапуск (рекламная пауза Twitch длится до 3 мин)
   live_check_seconds: 60
-  streamlink_extra_args: ["--twitch-disable-ads"]
+  streamlink_extra_args: []  # streamlink 8+ сам вырезает рекламу Twitch
 
 detector:
   tick_seconds: 2
