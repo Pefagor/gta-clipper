@@ -72,7 +72,8 @@ class Transcriber:
                         self._model = WhisperModel(self.cfg.get("model", "large-v3-turbo"), device=device,
                                                    compute_type=compute)
                         self.device, self.compute_type = device, compute
-                        log.info("whisper: %s на %s (%s)", self.cfg.get("model"), device, compute)
+                        log.info("🗣  Whisper %s загружен: %s (%s)", self.cfg.get("model"),
+                                 "видеокарта" if device == "cuda" else "процессор", compute)
                     result = self._run(wav)
                     if device == "cuda" and compute == "float16" and _looks_broken(result):
                         raise RuntimeError("cuda float16 дал пустой результат")

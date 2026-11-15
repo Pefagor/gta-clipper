@@ -119,6 +119,8 @@ class Recorder:
                 await asyncio.sleep(1)
                 if indexer.poll():
                     self.last_segment_at = time.time()
+                    if not self.healthy:
+                        log.info("📼 [%s] запись идёт, сегменты пишутся", self.login)
                     self.healthy = True
                 if streamlink.returncode is not None or ffmpeg.returncode is not None:
                     reason = "стрим закончился или пропало соединение"

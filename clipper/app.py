@@ -29,6 +29,21 @@ log = logging.getLogger(__name__)
 FINAL = ("rejected", "discarded", "failed", "done")
 
 
+def describe_trigger(trigger: str, score: float, signals: dict) -> str:
+    if trigger == "viewer_clip":
+        return "зрители сделали клип"
+    parts = []
+    if signals.get("rage"):
+        parts.append(f"КРИК +{signals.get('loud_by_db', 0):.0f} дБ")
+    if signals.get("chat_z", 0) >= 1:
+        parts.append(f"всплеск чата ×{signals['chat_z']:.1f}")
+    if signals.get("emote_score", 0) >= 0.5:
+        parts.append("эмоуты")
+    if not signals.get("rage") and signals.get("audio_z", 0) >= 1:
+        parts.append("громкий звук")
+    return f"балл {score:.1f}" + (" (" + ", ".join(parts) + ")" if parts else "")
+
+
 class App:
     def __init__(self, cfg: Config):
         self.cfg = cfg
@@ -44,7 +59,8 @@ class App:
         self.recorders: dict[str, Recorder] = {}
         self.detectors: dict[str, ChannelDetector] = {}
         self.open_windows: dict[str, OpenWindow] = {}
-        self.last_end: dict[str, float] = {}  # конец окна последнего кандидата канала
+        self.last_end: dict[str, float] = {}
+        self._last_status: dict[str, float] = {}  # конец окна последнего кандидата канала
         self.clip_moments: dict[str, deque] = defaultdict(lambda: deque(maxlen=200))
         self.seen_clips: set[str] = set()
         self.offline_checks: dict[str, int] = defaultdict(int)
@@ -59,7 +75,7 @@ class App:
         # сессии, оборванные падением или закрытием окна, считаем завершёнными — иначе уборка их не тронет
         self.db.execute("UPDATE sessions SET ended_at=? WHERE ended_at IS NULL", (time.time(),))
         (cfg.data_dir / "candidates").mkdir(exist_ok=True)
-        log.info("ffmpeg: %s · кодировщик: %s", self.ffmpeg, self.encoder)
+        log.info("⚙️  ffmpeg: %s · кодировщик видео: %s", self.ffmpeg, self.encoder)
 
     # ---------- настройки ----------
     def setting(self, name: str):
@@ -74,7 +90,7 @@ class App:
         if now - self._alerted.get(key, 0) < every:
             return
         self._alerted[key] = now
-        log.warning("ALERT %s", text)
+        log.warning("%s", text)
         if self.bot:
             await self.bot.notify("⚠️ " + html.escape(text), buttons)
 
@@ -182,7 +198,7 @@ class App:
         for login, ch in chans.items():
             rec = self.recorders.get(login)
             if rec and not rec.running:  # задача записи умерла — перезапускаем
-                log.warning("[%s] запись не работает, перезапускаю", login)
+                log.warning("[%s] запись не работает — перезапускаю", login)
                 await self._stop_recording(login)
                 rec = None
             if login in self.live:
@@ -199,7 +215,7 @@ class App:
                 if rec:
                     self.offline_checks[login] += 1
                     if self.offline_checks[login] >= 2:
-                        log.info("[%s] эфир закончился", login)
+                        log.info("⚫ [%s] эфир закончился", login)
                         await self._stop_recording(login)
                         if ch["state"] == "removing":
                             self.db.update_channel(login, state="removed", removed_at=time.time())
@@ -215,7 +231,7 @@ class App:
         self.chat.set_log(login, session_dir / "chat.jsonl")
         rec.start()
         await self.chat.join(login)
-        log.info("[%s] запись начата: %s", login, session_dir)
+        log.info("🔴 [%s] в эфире — начинаю запись", login)
 
     async def _stop_recording(self, login: str) -> None:
         rec = self.recorders.pop(login, None)
@@ -223,7 +239,7 @@ class App:
         if rec:
             await rec.stop()
             self.db.execute("UPDATE sessions SET ended_at=? WHERE id=?", (time.time(), rec.session_id))
-            log.info("[%s] запись остановлена", login)
+            log.info("⏹  [%s] запись остановлена", login)
         self.chat.set_log(login, None)
         await self.chat.part(login)
 
@@ -250,6 +266,7 @@ class App:
                         continue
                     det = self.detectors[login]
                     score, signals = det.tick(now, self.chat.history(login), rec.audio, list(self.clip_moments[login]))
+                    self._status_line(login, rec, score, signals, thr)
                     win = self.open_windows.get(login)
                     if score >= thr or signals.get("rage"):
                         # момент «по звуку» привязан к секунде крика, по чату — к «сейчас минус задержка чата»
@@ -269,6 +286,19 @@ class App:
             except Exception:  # noqa: BLE001
                 log.exception("ошибка детектора")
 
+    def _status_line(self, login: str, rec: Recorder, score: float, signals: dict, thr: float) -> None:
+        """Раз в минуту — что видит детектор, чтобы было понятно, что программа жива."""
+        now = time.time()
+        if now - self._last_status.get(login, 0) < 60:
+            return
+        self._last_status[login] = now
+        if signals.get("warmup"):
+            log.info("👂 [%s] изучаю обычный уровень чата и звука… (чат %d сообщ./10 с)", login, signals["chat"])
+            return
+        audio = signals.get("audio_db")
+        log.info("👂 [%s] чат %d сообщ./10 с · звук %s · балл %.1f из %.1f нужных", login, signals["chat"],
+                 f"{audio:.0f} дБ" if audio is not None else "тишина", score, thr)
+
     def _new_candidate(self, login: str, rec: Recorder, peak: float, score: float, signals: dict,
                        trigger: str, track: bool) -> int:
         dcfg = self.cfg.section("detector")
@@ -281,7 +311,7 @@ class App:
         if track:
             self.last_end[login] = end
             self.open_windows[login] = OpenWindow(cid, peak, start, end, score)
-        log.info("[%s] кандидат #%d (%s, балл %.1f)", login, cid, trigger, score)
+        log.info("🎯 [%s] момент #%d найден: %s", login, cid, describe_trigger(trigger, score, signals))
         return cid
 
     # ---------- клипы зрителей ----------
@@ -374,6 +404,7 @@ class App:
                                                   c["win_start"], c["win_end"], c["peak_ts"])
         if dur < 8:
             raise CutError(f"слишком короткий кусок записи ({dur:.0f} с)", permanent=True)
+        log.info("✂️  #%d вырезан фрагмент %d с", c["id"], dur)
         self.db.update_candidate(c["id"], status="cut", dir=str(out_dir), raw_start_ts=raw_start,
                                  raw_duration=dur, attempts=0, error=None)
 
@@ -381,6 +412,8 @@ class App:
         d = Path(c["dir"])
         wav = d / "audio.wav"
         await extract_audio(self.ffmpeg, d / "raw.mp4", wav)
+        log.info("🗣  #%d распознаю речь…", c["id"])
+        t0 = time.time()
         tr = await asyncio.to_thread(self.transcriber.transcribe, wav)
         try:  # крики — по самому звуку: Whisper громкость не передаёт
             tr["loud"] = await asyncio.to_thread(lambda: loud_events(read_wav(wav)))
@@ -388,6 +421,10 @@ class App:
             log.warning("громкость кандидата #%d: %s", c["id"], e)
         (d / "transcript.json").write_text(json.dumps(tr, ensure_ascii=False), encoding="utf-8")
         wav.unlink(missing_ok=True)
+        words = sum(len(s.get("words", [])) for s in tr.get("segments", []))
+        loud = len(tr.get("loud", []))
+        log.info("🗣  #%d речь распознана за %.0f с: %d слов%s", c["id"], time.time() - t0, words,
+                 f", криков: {loud}" if loud else "")
         self.db.update_candidate(c["id"], status="transcribed", attempts=0, error=None)
 
     async def _context(self, c: dict, screen: dict | None = None) -> str:
@@ -425,6 +462,7 @@ class App:
 
     async def _do_screen(self, c: dict) -> None:
         if not self.llm.enabled:  # без ключа routerai: пропускаем ИИ, на модерацию идёт всё окно
+            log.info("🤖 #%d ИИ-отбор выключен (нет ключа routerai) — беру фрагмент целиком", c["id"])
             self.db.update_candidate(c["id"], status="to_render", screen={"skipped": True}, clip_start=0.0,
                                      clip_end=c["raw_duration"], titles=["Момент со стрима"],
                                      title="Момент со стрима",
@@ -435,9 +473,13 @@ class App:
         d = Path(c["dir"])
         peak_rel = c["peak_ts"] - c["raw_start_ts"]
         frames = await extract_frames(self.ffmpeg, d / "raw.mp4", d, spread(c["raw_duration"], 3, peak_rel, 30), "s")
+        log.info("🤖 #%d Haiku оценивает момент…", c["id"])
         res = await self.llm.screen(await self._context(c), frames)
         thr = int(self.cfg.section("llm").get("screen_threshold", 6))
         status = "screened" if res["score"] >= thr else "discarded"
+        verdict = "дальше в Sonnet" if status == "screened" else f"отсеян (порог {thr})"
+        log.info("🤖 #%d Haiku: %d/10, %s — %s · %s", c["id"], res["score"], res["category"],
+                 res.get("summary", "")[:80], verdict)
         self.db.update_candidate(c["id"], status=status, screen=res, category=res["category"], attempts=0, error=None)
 
     async def _do_review(self, c: dict) -> None:
@@ -445,10 +487,15 @@ class App:
             return
         d = Path(c["dir"])
         frames = await extract_frames(self.ffmpeg, d / "raw.mp4", d, spread(c["raw_duration"], 6), "r")
+        log.info("🎬 #%d Sonnet выбирает границы и заголовки…", c["id"])
         res = await self.llm.review(await self._context(c, c.get("screen")), frames, c["raw_duration"])
         if not res["keep"]:
+            log.info("🎬 #%d Sonnet: не годится для ролика — отсеян", c["id"])
             self.db.update_candidate(c["id"], status="discarded", review=res)
             return
+        log.info("🎬 #%d Sonnet: %d/10, %s, %.0f–%.0f с (%.0f с)%s, «%s»", c["id"], res["score"], res["category"],
+                 res["start"], res["end"], res["end"] - res["start"], ", СПОЙЛЕР" if res["spoiler"] else "",
+                 res["titles"][0])
         self.db.update_candidate(c["id"], status="to_render", review=res, clip_start=res["start"],
                                  clip_end=res["end"], titles=res["titles"], title=res["titles"][0],
                                  category=res["category"], spoiler=int(res["spoiler"]), tag=res["tag"],
@@ -466,13 +513,17 @@ class App:
         cam = (ch["cam_x"], ch["cam_y"], ch["cam_w"], ch["cam_h"]) if ch.get("cam_status") == "ok" else None
         if cam and not await self._cam_present(raw, d, cam, start, end):
             # стример поменял раскладку (полноэкранная вебка, сцена «отошёл») — макет без вебки
-            log.info("кандидат #%d: в рамке вебки нет лица, рендер без вебки", c["id"])
+            log.info("🎥 #%d в рамке вебки нет лица — монтирую без вебки", c["id"])
             cam = None
         tr = json.loads((d / "transcript.json").read_text(encoding="utf-8"))
         out = d / "clip.mp4"
+        log.info("🎞  #%d монтирую 9:16 (%s, %.0f с)…", c["id"], "вебка сверху" if cam else "без вебки", end - start)
+        t0 = time.time()
         await render_clip(self.ffmpeg, self.encoder, raw, out, start, end, info["width"], info["height"], cam,
                           words_in(tr, start, end), c.get("title") or "",
                           f"twitch.tv/{c['channel']}", self.cfg.section("render"))
+        log.info("✅ #%d клип готов за %.0f с (%.1f МБ) → на модерацию", c["id"], time.time() - t0,
+                 out.stat().st_size / 1e6)
         self.db.update_candidate(c["id"], status="rendered", render_path=str(out), render_duration=end - start,
                                  clip_start=start, clip_end=end, edit_start=None, edit_end=None,
                                  card_msg_id=None, attempts=0, error=None)
@@ -589,13 +640,16 @@ class App:
             return False
         if not res.get("rect"):
             # лица нет (стример отошёл, заставка между играми) — не беспокоим, попробуем позже
-            log.info("[%s] вебка: лица в кадре нет, повторю через 5 минут", login)
+            log.info("🎥 [%s] лица в кадре нет (стример отошёл?) — поищу вебку через 5 минут", login)
             return False
         # последний кадр — основа для перерисовки рамки при ручной подстройке
         shutil.copy(frames[-1], work / "base.jpg")
         self.db.kv_set(f"cam:{login}", res.get("rect"))
         self.db.kv_set(f"cam_method:{login}", res.get("method"))
-        log.info("[%s] вебка: %s (%s)", login, res.get("rect"), res.get("method"))
+        log.info("🎥 [%s] вебка найдена (%s) — %s", login,
+                 "по краям рамки" if res.get("method") == "edges" else "примерно, по лицу",
+                 "жду подтверждения в боте" if self.bot else
+                 ("принята автоматически" if res.get("method") == "edges" else "без бота не принята"))
         if self.bot:
             await self.bot.send_cam_proposal(login, preview if preview.exists() else None, res.get("rect"),
                                              res.get("method"))

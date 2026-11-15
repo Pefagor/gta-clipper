@@ -128,6 +128,7 @@ class BotUI:
 
     # ================= запуск =================
     async def run(self) -> None:
+        log.info("🤖 Telegram-бот запущен%s", "" if self.owner_id else " (TELEGRAM_OWNER_ID не задан — напишите боту /start)")
         tasks = [asyncio.create_task(self._card_loop()), asyncio.create_task(self._publish_loop())]
         try:
             await self.dp.start_polling(self.bot, handle_signals=False)
@@ -217,6 +218,7 @@ class BotUI:
             await self.notify(f"⚠️ Клип #{c['id']} не отправился в Telegram: {html.escape(str(e)[:200])}")
             return False
         self.db.update_candidate(c["id"], card_msg_id=msg.message_id)
+        log.info("📨 #%d карточка отправлена в Telegram на модерацию", c["id"])
         return True
 
     async def _card_loop(self) -> None:
@@ -272,6 +274,7 @@ class BotUI:
             await q.answer("Этот клип уже обработан")
             return
         self.db.update_candidate(cid, status="approved" if ok else "rejected", decided_at=time.time())
+        log.info("%s #%d %s", "👍" if ok else "👎", cid, "одобрен — в очередь публикации" if ok else "отклонён")
         if not ok and c["kind"] == "compilation":
             self.app.release_parts(c)
         text = self._card_caption(c) + ("\n\n✅ <b>Одобрено</b>" if ok else "\n\n❌ <b>Отклонено</b>")
@@ -461,6 +464,7 @@ class BotUI:
                 await self.notify(f"⚠️ Пакет клипа #{cid} не отправился: {html.escape(str(e)[:200])}")
                 return False
             self.db.update_candidate(cid, status="sent", sent_at=time.time(), pkg_msg_id=msg.message_id)
+            log.info("📤 #%d пакет для публикации отправлен в Telegram", cid)
             return True
 
     def _next_publish_at(self) -> float:

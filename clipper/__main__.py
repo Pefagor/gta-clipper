@@ -11,17 +11,38 @@ from logging.handlers import RotatingFileHandler
 from .config import load_config
 
 
+class ConsoleFormatter(logging.Formatter):
+    """Консоль: «12:03:41 сообщение», предупреждения и ошибки помечены."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        msg = record.getMessage()
+        if record.levelno >= logging.ERROR:
+            msg = f"❗ ОШИБКА: {msg}"
+        elif record.levelno >= logging.WARNING:
+            msg = f"⚠️  {msg}"
+        line = f"{self.formatTime(record, '%H:%M:%S')} {msg}"
+        if record.exc_info and record.levelno >= logging.ERROR:
+            line += "\n" + self.formatException(record.exc_info)
+        return line
+
+
 def setup_logging(cfg) -> None:
     (cfg.data_dir / "logs").mkdir(exist_ok=True)
-    fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s", "%H:%M:%S")
+    # Windows: без этого эмодзи в консоли при перенаправлении вывода могут ронять логирование
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
     root = logging.getLogger()
     root.setLevel(logging.INFO)
-    for h in (logging.StreamHandler(sys.stdout),
-              RotatingFileHandler(cfg.data_dir / "logs" / "app.log", maxBytes=5_000_000, backupCount=5,
-                                  encoding="utf-8")):
-        h.setFormatter(fmt)
-        root.addHandler(h)
-    for noisy in ("httpx", "aiogram.event", "faster_whisper"):
+    console = logging.StreamHandler(sys.stdout)
+    console.setFormatter(ConsoleFormatter())
+    file = RotatingFileHandler(cfg.data_dir / "logs" / "app.log", maxBytes=5_000_000, backupCount=5, encoding="utf-8")
+    file.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s", "%H:%M:%S"))
+    root.addHandler(console)
+    root.addHandler(file)
+    for noisy in ("httpx", "httpx2", "httpcore", "aiogram.event", "aiogram.dispatcher", "faster_whisper"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
 
@@ -31,7 +52,7 @@ async def cmd_run(cfg, extra_channels: list[str]) -> None:
     app = App(cfg)
     for login in extra_channels:
         ok, info = await app.add_channel(login)
-        logging.info("канал %s: %s", login, info if ok else f"не добавлен ({info})")
+        logging.info("📺 канал %s: %s", login, "добавлен" if ok else info)
     if cfg.secrets.telegram_token:
         from .bot import BotUI
         app.bot = BotUI(app, cfg.secrets.telegram_token, cfg.secrets.telegram_owner_id)
@@ -40,7 +61,7 @@ async def cmd_run(cfg, extra_channels: list[str]) -> None:
     else:
         logging.warning("TELEGRAM_BOT_TOKEN не задан: бот выключен, клипы будут копиться в data/candidates")
     await app.start()
-    logging.info("работаю. Каналы: %s", ", ".join(c["login"] for c in app.db.channels()) or "нет")
+    logging.info("▶️  программа запущена. Каналы: %s", ", ".join(c["login"] for c in app.db.channels()) or "нет")
     try:
         if app.bot:
             await app.bot.run()

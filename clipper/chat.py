@@ -92,7 +92,7 @@ class ChatHub:
                     self._joined.add(login)
                 self.connected = True
                 backoff = 2
-                log.info("чат подключён")
+                log.info("💬 чат Twitch подключён")
                 while True:
                     raw = await asyncio.wait_for(reader.readline(), timeout=360)
                     if not raw:
