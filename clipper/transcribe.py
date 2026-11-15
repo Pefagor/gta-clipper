@@ -8,6 +8,26 @@ from pathlib import Path
 log = logging.getLogger(__name__)
 
 
+def _add_cuda_dlls() -> None:
+    """Windows: DLL из pip-пакетов nvidia-cublas-cu12 / nvidia-cudnn-cu12 лежат в site-packages/nvidia/*/bin,
+    а не в PATH — без этого CTranslate2 не видит видеокарту."""
+    import os
+    import sys
+    if sys.platform != "win32":
+        return
+    import site
+    for sp in site.getsitepackages() + [site.getusersitepackages()]:
+        for bin_dir in Path(sp, "nvidia").glob("*/bin"):
+            try:
+                os.add_dll_directory(str(bin_dir))
+                os.environ["PATH"] = str(bin_dir) + os.pathsep + os.environ.get("PATH", "")
+            except OSError:
+                pass
+
+
+_add_cuda_dlls()
+
+
 class Transcriber:
     def __init__(self, cfg: dict):
         self.cfg = cfg
