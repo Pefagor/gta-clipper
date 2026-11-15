@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import shutil
 import subprocess
 import sys
@@ -32,7 +33,14 @@ def find_ffmpeg(setting: str = "auto") -> str:
     if setting and setting != "auto":
         return setting
     found = []
-    for cand in _FFMPEG_CANDIDATES:
+    candidates = list(_FFMPEG_CANDIDATES)
+    if sys.platform == "win32":
+        # winget прописывает PATH только для новых окон терминала — ищем и в его папках напрямую
+        local = Path(os.environ.get("LOCALAPPDATA", ""))
+        candidates.insert(0, str(local / "Microsoft" / "WinGet" / "Links" / "ffmpeg.exe"))
+        candidates += [str(p) for p in sorted((local / "Microsoft" / "WinGet" / "Packages").glob(
+            "Gyan.FFmpeg*/*/bin/ffmpeg.exe"), reverse=True)]
+    for cand in candidates:
         path = cand if Path(cand).is_absolute() else shutil.which(cand)
         if path and Path(path).exists():
             found.append(path)
@@ -41,7 +49,8 @@ def find_ffmpeg(setting: str = "auto") -> str:
     if found:
         log.warning("ffmpeg без libass (субтитры не будут работать): %s", found[0])
         return found[0]
-    raise RuntimeError("ffmpeg не найден. Установите его (Windows: winget install Gyan.FFmpeg)")
+    raise RuntimeError("ffmpeg не найден. Установите его (Windows: winget install Gyan.FFmpeg) и откройте "
+                       "новое окно терминала, либо укажите полный путь в config.yaml (ffmpeg: ...)")
 
 
 @lru_cache(maxsize=None)
