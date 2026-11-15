@@ -44,6 +44,7 @@ whisper:
 
 llm:
   base_url: https://routerai.ru/api/v1
+  use_system_proxy: false    # true — ходить в routerai через системный прокси (HTTPS_PROXY)
   screen_model: anthropic/claude-haiku-5.5
   review_model: anthropic/claude-sonnet-5.5
   screen_threshold: 6

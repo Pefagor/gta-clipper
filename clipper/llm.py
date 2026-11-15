@@ -105,8 +105,11 @@ class RouterAI:
         self.cfg = cfg
         self.api_key = api_key
         self.on_usage = on_usage  # callback(model, in_tok, out_tok, cost_rub)
+        # trust_env=False: системный прокси/VPN-прокси (HTTPS_PROXY), заданный ради Telegram, не используем —
+        # routerai.ru российский сервис и доступен напрямую. Включить прокси: llm.use_system_proxy: true
         self.http = httpx.AsyncClient(base_url=cfg.get("base_url", "https://routerai.ru/api/v1"),
-                                      timeout=float(cfg.get("timeout", 120)))
+                                      timeout=float(cfg.get("timeout", 120)),
+                                      trust_env=bool(cfg.get("use_system_proxy", False)))
 
     @property
     def enabled(self) -> bool:
@@ -162,7 +165,7 @@ class RouterAI:
                 "tag": str(res.get("tag") or "").strip()[:40], "description": str(res.get("description") or "")[:200]}
 
     async def list_models(self) -> list[str]:
-        r = await self.http.get("/models", headers={"Authorization": f"Bearer {self.api_key}"})
+        r = await self.http.get("/models", headers={"Authorization": f"Bearer {self.api_key}"}, timeout=15)
         r.raise_for_status()
         return [m.get("id") for m in r.json().get("data", [])]
 
