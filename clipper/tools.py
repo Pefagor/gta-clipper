@@ -61,11 +61,12 @@ def streamlink_cmd(setting: str = "auto") -> list[str]:
     try:
         import streamlink  # noqa: F401
         return [sys.executable, "-m", "streamlink"]
-    except ImportError:
+    except ImportError as e:
         path = shutil.which("streamlink")
         if path:
             return [path]
-        raise RuntimeError("streamlink не найден: выполните pip install -e . в окружении программы")
+        raise RuntimeError(f"streamlink не найден в окружении {sys.executable} ({e}). "
+                           "Активируйте окружение и выполните: pip install -e .") from e
 
 
 @lru_cache(maxsize=None)
