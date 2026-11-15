@@ -120,6 +120,40 @@ async def cmd_doctor(cfg) -> int:
     return 0 if ok else 1
 
 
+STAGE = {"to_cut": "ждёт вырезки", "cut": "ждёт распознавания речи", "transcribed": "ждёт Haiku",
+         "screened": "ждёт Sonnet", "to_render": "ждёт монтажа", "rendered": "на модерации",
+         "approved": "ждёт публикации", "failed": "ошибка"}
+
+
+def cmd_queue(cfg) -> None:
+    import time
+
+    from .db import DB
+    for stream in (sys.stdout,):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
+    db = DB(cfg.data_dir / "app.db")
+    rows = db.all("SELECT id, channel, status, attempts, error, next_try_at, created_at FROM candidates "
+                  "WHERE status IN ('to_cut','cut','transcribed','screened','to_render','rendered','approved') "
+                  "OR (status='failed' AND updated_at > ?) ORDER BY id", (time.time() - 86400,))
+    if not rows:
+        print("Очередь пуста.")
+        return
+    now = time.time()
+    for r in rows:
+        age = int((now - (r["created_at"] or now)) / 60)
+        line = f"#{r['id']:<4} {r['channel'] or '':15} {STAGE.get(r['status'], r['status']):26} {age:>4} мин назад"
+        if r["attempts"]:
+            line += f" · попыток: {r['attempts']}"
+        if r["next_try_at"] and r["next_try_at"] > now:
+            line += f" · повтор через {int(r['next_try_at'] - now)} с"
+        print(line)
+        if r["error"]:
+            print(f"      ошибка: {r['error'][:300]}")
+
+
 def main() -> None:
     p = argparse.ArgumentParser(prog="clipper", description="Нарезка вертикальных клипов из стримов Twitch")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -131,11 +165,14 @@ def main() -> None:
     d.add_argument("login")
     sub.add_parser("list", help="список каналов")
     sub.add_parser("doctor", help="проверить установку и ключи")
+    sub.add_parser("queue", help="что сейчас в обработке и почему")
     args = p.parse_args()
 
     cfg = load_config()
     if args.cmd == "doctor":
         sys.exit(asyncio.run(cmd_doctor(cfg)))
+    if args.cmd == "queue":
+        return cmd_queue(cfg)
     setup_logging(cfg)
     if args.cmd == "run":
         try:
