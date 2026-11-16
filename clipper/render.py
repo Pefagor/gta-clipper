@@ -20,14 +20,40 @@ def _esc(text: str) -> str:
     return text.replace("\\", "").replace("{", "(").replace("}", ")").replace("\n", " ")
 
 
-def group_words(words: list[dict], max_words: int = 3, max_gap: float = 0.8) -> list[list[dict]]:
+def group_words(words: list[dict], max_words: int = 3, max_gap: float = 0.8,
+                max_chars: int = 16) -> list[list[dict]]:
+    """Слова в короткие фразы, каждая помещается в одну строку (не больше max_chars символов)."""
     groups: list[list[dict]] = []
     for w in words:
-        if groups and len(groups[-1]) < max_words and w["start"] - groups[-1][-1]["end"] <= max_gap:
-            groups[-1].append(w)
-        else:
-            groups.append([w])
+        if groups:
+            g = groups[-1]
+            chars = sum(len(x["word"]) for x in g) + len(g) + len(w["word"])
+            if len(g) < max_words and chars <= max_chars and w["start"] - g[-1]["end"] <= max_gap:
+                g.append(w)
+                continue
+        groups.append([w])
     return groups
+
+
+def subtitle_events(words: list[dict], hold_gap: float = 0.6, tail: float = 0.3) -> list[tuple[float, float, str]]:
+    """(начало, конец, текст с подсветкой текущего слова). События не перекрываются по времени:
+    иначе libass раздвигает одновременные строки по вертикали и субтитры «прыгают»."""
+    raw: list[tuple[float, float, str]] = []
+    for group in group_words(words):
+        texts = [_esc(w["word"]).upper() for w in group]
+        for i, w in enumerate(group):
+            end = group[i + 1]["start"] if i + 1 < len(group) else max(w["end"], w["start"] + 0.3) + tail
+            line = " ".join((r"{\c&H00E5FF&}" + t + r"{\c&HFFFFFF&}") if j == i else t for j, t in enumerate(texts))
+            raw.append((w["start"], end, line))
+    raw.sort(key=lambda e: e[0])
+    events = []
+    for i, (start, end, text) in enumerate(raw):
+        if i + 1 < len(raw):
+            nxt = raw[i + 1][0]
+            end = nxt if nxt - end <= hold_gap else min(end, nxt)  # короткую паузу держим, наложение срезаем
+        if end - start >= 0.05:
+            events.append((start, end, text))
+    return events
 
 
 def build_ass(words: list[dict], title: str, credit: str, has_cam: bool, font: str = "Arial",
@@ -35,6 +61,7 @@ def build_ass(words: list[dict], title: str, credit: str, has_cam: bool, font: s
     """words — со временем относительно начала ролика."""
     sub_margin = 420 if has_cam else 520
     title_margin = CAM_H + 40 if has_cam else 300
+    sub_y = height - sub_margin  # нижний край строки субтитров — всегда в одной точке
     head = f"""[Script Info]
 ScriptType: v4.00+
 PlayResX: {width}
@@ -53,18 +80,13 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 """
     events = []
     if title:
-        events.append(f"Dialogue: 1,{_ass_time(0)},{_ass_time(title_seconds)},Title,,0,0,0,,{_esc(title)}")
+        events.append(f"Dialogue: 2,{_ass_time(0)},{_ass_time(title_seconds)},Title,,0,0,0,,{_esc(title)}")
     if credit:
-        events.append(f"Dialogue: 0,{_ass_time(0)},{_ass_time(3600)},Credit,,0,0,0,,{_esc(credit)}")
-    for group in group_words(words):
-        texts = [_esc(w["word"]).upper() for w in group]
-        for i, w in enumerate(group):
-            start = w["start"]
-            end = group[i + 1]["start"] if i + 1 < len(group) else max(w["end"], start + 0.3)
-            if end <= start:
-                continue
-            line = " ".join((r"{\c&H00E5FF&}" + t + r"{\c&HFFFFFF&}") if j == i else t for j, t in enumerate(texts))
-            events.append(f"Dialogue: 0,{_ass_time(start)},{_ass_time(end)},Sub,,0,0,0,,{line}")
+        events.append(f"Dialogue: 1,{_ass_time(0)},{_ass_time(3600)},Credit,,0,0,0,,{_esc(credit)}")
+    # \pos — фиксированная точка: позиционированные строки libass не сдвигает при наложениях
+    pos = f"{{\\an2\\pos({width // 2},{sub_y})}}"
+    for start, end, text in subtitle_events(words):
+        events.append(f"Dialogue: 0,{_ass_time(start)},{_ass_time(end)},Sub,,0,0,0,,{pos}{text}")
     return head + "\n".join(events) + "\n"
 
 

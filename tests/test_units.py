@@ -76,11 +76,28 @@ def test_parse_json_variants():
 def test_group_and_ass():
     words = [{"start": 0.0, "end": 0.3, "word": "это"}, {"start": 0.3, "end": 0.6, "word": "было"},
              {"start": 0.6, "end": 1.0, "word": "{жёстко}"}, {"start": 3.0, "end": 3.4, "word": "да"}]
-    assert [len(g) for g in group_words(words)] == [3, 1]
+    # «это было {жёстко}» — 17 символов, в одну строку не влезет: третье слово уходит в новую фразу
+    assert [len(g) for g in group_words(words)] == [2, 1, 1]
     ass = build_ass(words, "Заголовок", "twitch.tv/x", has_cam=True)
     assert "Style: Sub" in ass and "Заголовок" in ass and "twitch.tv/x" in ass
     assert "{жёстко}" not in ass and "(ЖЁСТКО)" in ass
     assert ass.count("Style: Sub") == 1 and ass.count(",Sub,") == 4
+    # каждая строка субтитров прибита к одной точке
+    assert ass.count(r"{\an2\pos(540,1500)}") == 4
+
+
+def test_subtitle_events_never_overlap():
+    """Наложение двух строк по времени заставляет libass раздвигать их — субтитры «прыгают»."""
+    from clipper.render import subtitle_events
+    words = [{"start": 0.0, "end": 0.5, "word": "раз"}, {"start": 0.5, "end": 1.4, "word": "два"},
+             {"start": 1.2, "end": 1.6, "word": "три"},  # Whisper иногда даёт слова внахлёст
+             {"start": 1.6, "end": 1.9, "word": "четыре"}, {"start": 2.2, "end": 2.5, "word": "пять"},
+             {"start": 6.0, "end": 6.4, "word": "шесть"}]
+    ev = subtitle_events(words)
+    for (s1, e1, _), (s2, _, _) in zip(ev, ev[1:]):
+        assert e1 <= s2 + 1e-9
+    assert len(ev) == 6
+    assert ev[-2][1] < 6.0  # длинная пауза — строка исчезает, а не висит до следующей фразы
 
 
 def test_filters_and_bitrate():
