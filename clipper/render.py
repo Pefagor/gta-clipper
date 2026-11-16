@@ -68,9 +68,21 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     return head + "\n".join(events) + "\n"
 
 
+IMAGE_EXT = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
+
+
 def video_filter(src_w: int, src_h: int, cam: tuple[float, float, float, float] | None,
-                 width: int = 1080, height: int = 1920, fps: int = 30) -> str:
-    """filter_complex: на выходе [v] (с наложенными субтитрами из subs.ass)."""
+                 width: int = 1080, height: int = 1920, fps: int = 30, media: bool = False) -> str:
+    """filter_complex: на выходе [v] (с наложенными субтитрами из subs.ass).
+
+    media=True — верх кадра берётся из второго входа [1:v] (заставка: картинка или видео вместо вебки)."""
+    if media:
+        game_h = height - CAM_H
+        game_w_src = int(src_h * width / game_h) // 2 * 2
+        return (f"[1:v]scale={width}:{CAM_H}:force_original_aspect_ratio=increase,crop={width}:{CAM_H},"
+                f"setsar=1,fps={fps}[cam];"
+                f"[0:v]crop={min(game_w_src, src_w)}:{src_h},scale={width}:{game_h},setsar=1,fps={fps}[game];"
+                f"[cam][game]vstack=inputs=2:shortest=1,ass=subs.ass[v]")
     if cam:
         cx, cy, cw, ch = cam
         x, y = int(cx * src_w), int(cy * src_h)
@@ -96,19 +108,27 @@ def target_kbps(duration: float, max_mb: float, max_kbps: int, audio_kbps: int =
 
 async def render_clip(ffmpeg: str, encoder: str, raw: Path, out: Path, start: float, end: float,
                       src_w: int, src_h: int, cam, words: list[dict], title: str, credit: str,
-                      rcfg: dict) -> Path:
+                      rcfg: dict, top_media: Path | None = None) -> Path:
+    """cam — рамка вебки в исходнике; top_media — картинка/видео вместо вебки (важнее cam)."""
     work = out.parent
     work.mkdir(parents=True, exist_ok=True)
     rel_words = [{**w, "start": w["start"] - start, "end": w["end"] - start}
                  for w in words if w["end"] > start and w["start"] < end]
-    (work / "subs.ass").write_text(build_ass(rel_words, title, credit, bool(cam), rcfg.get("font", "Arial")),
+    (work / "subs.ass").write_text(build_ass(rel_words, title, credit, bool(cam or top_media),
+                                             rcfg.get("font", "Arial")),
                                    encoding="utf-8")
     dur = end - start
     kbps = target_kbps(dur, rcfg.get("max_file_mb", 45), rcfg.get("max_video_kbps", 8000))
-    fc = video_filter(src_w, src_h, cam, rcfg.get("width", 1080), rcfg.get("height", 1920), rcfg.get("fps", 30))
+    fc = video_filter(src_w, src_h, cam, rcfg.get("width", 1080), rcfg.get("height", 1920), rcfg.get("fps", 30),
+                      media=bool(top_media))
+    extra_in: list[str] = []
+    if top_media:
+        loop = (["-loop", "1", "-framerate", str(rcfg.get("fps", 30))] if top_media.suffix.lower() in IMAGE_EXT
+                else ["-stream_loop", "-1"])  # видео-заставка крутится по кругу, её звук не используется
+        extra_in = [*loop, "-i", str(top_media)]
     lufs = rcfg.get("loudness_lufs", -14)
     cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-ss", f"{start:.2f}", "-to", f"{end:.2f}",
-           "-i", str(raw), "-filter_complex", fc, "-map", "[v]", "-map", "0:a:0?",
+           "-i", str(raw), *extra_in, "-filter_complex", fc, "-map", "[v]", "-map", "0:a:0?", "-t", f"{dur:.2f}",
            *encoder_args(encoder, kbps), "-pix_fmt", "yuv420p",
            "-af", f"loudnorm=I={lufs}:TP=-1.5:LRA=11,aresample=48000", "-c:a", "aac", "-b:a", "160k",
            "-movflags", "+faststart", out.name]

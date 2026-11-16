@@ -114,3 +114,17 @@ def test_db_migration_adds_game_column(tmp_path):
     db = DB(path)
     db.add_candidate(channel="x", status="to_cut", game="Dota 2")
     assert db.one("SELECT game FROM candidates")["game"] == "Dota 2"
+
+
+def test_cam_mode_and_overlay_resolution(app):
+    app.db.execute("INSERT INTO channels(login,display_name,state,added_at) VALUES('a','a','active',0)")
+    assert app.cam_mode("a") == "auto"                  # по умолчанию — искать вебку
+    app.set_setting("cam_default", "off")
+    assert app.cam_mode("a") == "off"                   # общий режим
+    app.db.update_channel("a", cam_mode="media")
+    assert app.cam_mode("a") == "media"                 # режим канала важнее общего
+    assert app.channel_overlay("a") == (None, "нет файла")
+    (app.overlay_dir() / "_default.png").write_bytes(b"x")
+    assert app.channel_overlay("a")[1] == "общая"
+    (app.overlay_dir() / "a.mp4").write_bytes(b"x")
+    assert app.channel_overlay("a")[1] == "своя"        # своя заставка канала важнее общей

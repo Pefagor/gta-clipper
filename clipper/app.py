@@ -211,7 +211,8 @@ class App:
                 self.offline_checks[login] = 0
                 if not rec and ch["state"] == "active":
                     await self._start_recording(login)
-                elif (rec and rec.healthy and ch["cam_status"] == "unknown" and time.time() - rec.started_at > 60
+                elif (rec and rec.healthy and ch["cam_status"] == "unknown" and self.cam_mode(login) == "auto"
+                      and time.time() - rec.started_at > 60
                       and time.time() >= (self.db.kv_get(f"cam_next:{login}") or 0)):
                     self.db.update_channel(login, cam_status="pending")
                     self.spawn(self.calibrate_cam(login))
@@ -517,18 +518,28 @@ class App:
         start, end = (c["edit_start"], c["edit_end"]) if c.get("edit_start") is not None else (c["clip_start"], c["clip_end"])
         start, end = max(0.0, start), min(info["duration"] or c["raw_duration"], end)
         ch = self.db.channel(c["channel"]) or {}
+        mode = self.cam_mode(c["channel"])
         cam = (ch["cam_x"], ch["cam_y"], ch["cam_w"], ch["cam_h"]) if ch.get("cam_status") == "ok" else None
+        top_media = None
+        if mode == "off":
+            cam = None
+        elif mode == "media":
+            cam = None
+            top_media, _ = self.channel_overlay(c["channel"])
+            if not top_media:
+                log.warning("#%d режим «заставка», но файла заставки нет — монтирую без вебки", c["id"])
         if cam and not await self._cam_present(raw, d, cam, start, end):
             # стример поменял раскладку (полноэкранная вебка, сцена «отошёл») — макет без вебки
             log.info("🎥 #%d в рамке вебки нет лица — монтирую без вебки", c["id"])
             cam = None
         tr = json.loads((d / "transcript.json").read_text(encoding="utf-8"))
         out = d / "clip.mp4"
-        log.info("🎞  #%d монтирую 9:16 (%s, %.0f с)…", c["id"], "вебка сверху" if cam else "без вебки", end - start)
+        layout = "заставка сверху" if top_media else "вебка сверху" if cam else "без вебки"
+        log.info("🎞  #%d монтирую 9:16 (%s, %.0f с)…", c["id"], layout, end - start)
         t0 = time.time()
         await render_clip(self.ffmpeg, self.encoder, raw, out, start, end, info["width"], info["height"], cam,
                           words_in(tr, start, end), c.get("title") or "",
-                          f"twitch.tv/{c['channel']}", self.cfg.section("render"))
+                          f"twitch.tv/{c['channel']}", self.cfg.section("render"), top_media=top_media)
         log.info("✅ #%d клип готов за %.0f с (%.1f МБ) → на модерацию", c["id"], time.time() - t0,
                  out.stat().st_size / 1e6)
         self.db.update_candidate(c["id"], status="rendered", render_path=str(out), render_duration=end - start,
@@ -687,6 +698,30 @@ class App:
             self.db.update_channel(login, cam_status="ok", cam_x=x, cam_y=y, cam_w=w, cam_h=h)
         else:
             self.db.update_channel(login, cam_status="none")
+
+    # ---------- режим вебки и заставки ----------
+    def cam_mode(self, login: str) -> str:
+        """auto | off | media — режим канала, если задан, иначе общий по умолчанию."""
+        ch = self.db.channel(login) or {}
+        mode = ch.get("cam_mode") or self.setting("cam_default") or "auto"
+        return mode if mode in ("auto", "off", "media") else "auto"
+
+    def overlay_dir(self) -> Path:
+        d = self.cfg.data_dir / "overlays"
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    def overlay_path(self, key: str) -> Path | None:
+        """Файл заставки: key — логин канала или "_default" (общая)."""
+        files = sorted(self.overlay_dir().glob(f"{key}.*"))
+        return files[0] if files else None
+
+    def channel_overlay(self, login: str) -> tuple[Path | None, str]:
+        own = self.overlay_path(login)
+        if own:
+            return own, "своя"
+        common = self.overlay_path("_default")
+        return (common, "общая") if common else (None, "нет файла")
 
     # ---------- уборка ----------
     async def _janitor_loop(self) -> None:

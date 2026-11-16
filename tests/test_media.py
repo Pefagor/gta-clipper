@@ -58,3 +58,26 @@ def test_cut_and_render(session: Path, tmp_path: Path):
         assert (v["width"], v["height"]) == (1080, 1920) and abs(v["duration"] - 22) < 1.0
 
     asyncio.run(go())
+
+
+@pytest.mark.parametrize("kind", ["image", "video"])
+def test_render_with_overlay(session: Path, tmp_path: Path, kind: str):
+    """Вместо вебки сверху — заставка (картинка или видео, видео крутится по кругу)."""
+    t0 = 1_000_000.0
+    if kind == "image":
+        media = tmp_path / "overlay.png"
+        subprocess.run([FF, "-loglevel", "error", "-f", "lavfi", "-i", "color=c=orange:s=800x450", "-frames:v", "1",
+                        str(media)], check=True)
+    else:
+        media = tmp_path / "overlay.mp4"  # короче клипа — должно зациклиться
+        subprocess.run([FF, "-loglevel", "error", "-f", "lavfi", "-i", "testsrc=s=640x360:r=30:d=3",
+                        "-c:v", "libx264", "-preset", "ultrafast", str(media)], check=True)
+
+    async def go():
+        raw, _, _ = await cut_candidate(FF, session, tmp_path, t0 + 6, t0 + 30, t0 + 15)
+        out = await render_clip(FF, ENC, raw, tmp_path / "ov" / "clip.mp4", 1.0, 11.0, 1280, 720, None,
+                                [], "Заставка", "twitch.tv/test", RCFG, top_media=media)
+        v = await probe(FP, out)
+        assert (v["width"], v["height"]) == (1080, 1920) and abs(v["duration"] - 10) < 0.6
+
+    asyncio.run(go())

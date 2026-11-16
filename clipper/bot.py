@@ -23,6 +23,7 @@ from .db import day_start
 log = logging.getLogger(__name__)
 
 BTN_MOD, BTN_PUB, BTN_CH, BTN_ST, BTN_SET = "🎬 Модерация", "📤 Публикация", "📺 Каналы", "📊 Статус", "⚙️ Настройки"
+CAM_MODES = {"auto": "авто", "off": "выкл", "media": "заставка"}
 CAT_ICON = {"смешное": "😂", "рейдж": "🤬", "баг": "🐞", "погоня": "🚓", "реакция": "😱", "эпичное": "🔥", "подборка": "🎞",
             "другое": "🎬"}
 SENS = {"low": "Меньше кандидатов", "mid": "Средне", "high": "Больше"}
@@ -44,6 +45,7 @@ class Input(StatesGroup):
     title = State()
     hashtags = State()
     limit = State()
+    overlay = State()
 
 
 class Owner(BaseFilter):
@@ -190,6 +192,7 @@ class BotUI:
         r.message.register(self.in_title, Input.title)
         r.message.register(self.in_hashtags, Input.hashtags)
         r.message.register(self.in_limit, Input.limit)
+        r.message.register(self.in_overlay, Input.overlay)
         r.callback_query.register(self.cb, F.data)
         self.dp.include_router(public)
         self.dp.include_router(r)
@@ -622,16 +625,33 @@ class BotUI:
             head = f"⏸ <b>{name}</b> — на паузе"
         else:
             head = f"⚫ <b>{name}</b> — офлайн"
-        cam = {"ok": "✅ настроена", "none": "🚫 без вебки", "pending": "⏳ ждёт подтверждения",
-               "unknown": "настроится при первом эфире"}[ch["cam_status"]]
+        mode = self.app.cam_mode(login)
+        if mode == "off":
+            cam = "выключена — игра на размытом фоне"
+        elif mode == "media":
+            path, which = self.app.channel_overlay(login)
+            cam = f"вместо неё заставка ({which})" + ("" if path else " — загрузите файл 🖼")
+        else:
+            cam = {"ok": "✅ настроена", "none": "🚫 не найдена", "pending": "⏳ ждёт подтверждения",
+                   "unknown": "настроится при первом эфире"}[ch["cam_status"]]
+        if not ch.get("cam_mode"):
+            cam += " (режим по умолчанию)"
         today = day_start()
         clips = self.db.scalar("SELECT COUNT(*) FROM candidates WHERE channel=? AND decided_at>=? AND status IN "
                                "('approved','sent','done')", (login, today)) or 0
         cands = self.db.scalar("SELECT COUNT(*) FROM candidates WHERE channel=? AND created_at>=?", (login, today)) or 0
         text = f"{head}\nВебка: {cam} · Клипов сегодня: {clips} · Кандидатов: {cands}"
         pause = ("▶️ Продолжить", f"ch:resume:{login}") if ch["state"] == "paused" else ("⏸ Пауза", f"ch:pause:{login}")
-        return text, kb([[pause, ("🎥 Настроить вебку", f"ch:cam:{login}")],
-                         [("🗑 Удалить", f"ch:del:{login}"), ("← Назад", "ch:list:0")]])
+        own = ch.get("cam_mode")
+        mode_label = f"🎥 Режим: {CAM_MODES[own]}" if own else "🎥 Режим: по умолчанию"
+        rows = [[pause, (mode_label, f"ch:cmode:{login}")],
+                [("🖼 Своя заставка", f"ch:ovl:{login}")]]
+        if mode == "auto":
+            rows[1].insert(0, ("🎯 Найти вебку", f"ch:cam:{login}"))
+        if self.app.overlay_path(login):
+            rows[1].append(("🗑 Убрать заставку", f"ch:ovldel:{login}"))
+        rows.append([("🗑 Удалить", f"ch:del:{login}"), ("← Назад", "ch:list:0")])
+        return text, kb(rows)
 
     async def cb_ch(self, q, state, action, arg, parts):
         login = arg
@@ -671,6 +691,24 @@ class BotUI:
             text, markup = self._channels_view()
             note = "Удалён." if action == "delnow" else "Удалится после конца стрима."
             await self._safe(q.message.edit_text(f"{note}\n\n{text}", reply_markup=markup))
+        elif action == "cmode":  # по умолчанию → авто → выкл → заставка → по умолчанию
+            order = [None, "auto", "off", "media"]
+            cur = (self.db.channel(login) or {}).get("cam_mode")
+            nxt = order[(order.index(cur) + 1) % len(order) if cur in order else 0]
+            self.db.update_channel(login, cam_mode=nxt)
+            text, markup = self._channel_card(login)
+            await self._safe(q.message.edit_text(text, reply_markup=markup))
+        elif action == "ovl":
+            await state.set_state(Input.overlay)
+            await state.update_data(key=login)
+            await q.message.answer("Пришлите картинку или короткое видео — оно встанет вместо вебки этого канала "
+                                   "(верхняя часть клипа, 1080×640). Видео крутится по кругу без звука. "
+                                   "Файл до 20 МБ.")
+        elif action == "ovldel":
+            for f in self.app.overlay_dir().glob(f"{login}.*"):
+                f.unlink(missing_ok=True)
+            text, markup = self._channel_card(login)
+            await self._safe(q.message.edit_text(text, reply_markup=markup))
         elif action == "restart":
             await self.app.restart_recording(login)
             return await q.answer("Перезапускаю запись")
@@ -811,6 +849,8 @@ class BotUI:
                 [(mark(mode == "schedule", "По расписанию"), "s:mode:schedule"),
                  (mark(mode == "now", "Сразу после ✅"), "s:mode:now")],
                 [("✏️ Хэштеги", "s:tags:0"), ("💰 Лимит API", "s:limit:0")],
+                [(f"🎥 Вебка по умолчанию: {CAM_MODES.get(a.setting('cam_default') or 'auto', 'авто')}", "s:cdef:0"),
+                 ("🖼 Общая заставка" + (" ✅" if a.overlay_path("_default") else ""), "s:ovl:0")],
                 [(("🔔 Звук вкл" if a.setting("quiet") else "🌙 Тихий режим"), "s:quiet:0"),
                  (("▶️ Возобновить всё" if a.setting("paused") else "🛑 Пауза всего"), "s:pause:0")]]
         return text, kb(rows)
@@ -847,6 +887,16 @@ class BotUI:
             await q.message.answer("Пришлите общие хэштеги через пробел, например: <code>#стрим #нарезка</code>.\n"
                                    "Хэштеги игры добавляются сами (настраиваются в config.yaml, раздел games).")
             return await q.answer()
+        elif action == "cdef":
+            order = ["auto", "off", "media"]
+            cur = a.setting("cam_default") or "auto"
+            a.set_setting("cam_default", order[(order.index(cur) + 1) % 3 if cur in order else 0])
+        elif action == "ovl":
+            await state.set_state(Input.overlay)
+            await state.update_data(key="_default")
+            await q.message.answer("Пришлите картинку или короткое видео — общая заставка вместо вебки для каналов "
+                                   "в режиме «заставка» без своей. Видео крутится по кругу без звука. Файл до 20 МБ.")
+            return await q.answer()
         elif action == "limit":
             await state.set_state(Input.limit)
             await q.message.answer("Пришлите дневной лимит расходов на API в рублях (0 — без лимита).")
@@ -860,6 +910,34 @@ class BotUI:
         tags = " ".join(t if t.startswith("#") else f"#{t}" for t in (m.text or "").split())[:200]
         self.app.set_setting("hashtags", tags)
         await m.answer(f"Хэштеги: {html.escape(tags) or '—'}", reply_markup=MAIN_KB)
+
+    async def in_overlay(self, m: Message, state: FSMContext):
+        """Загрузка заставки: фото, видео, GIF или файл-картинка/видео."""
+        data = await state.get_data()
+        key = data.get("key") or "_default"
+        if m.photo:
+            file, ext = m.photo[-1], ".jpg"
+        elif m.video:
+            file, ext = m.video, ".mp4"
+        elif m.animation:
+            file, ext = m.animation, ".mp4"
+        elif m.document and (m.document.mime_type or "").split("/")[0] in ("image", "video"):
+            file = m.document
+            ext = Path(m.document.file_name or "").suffix.lower() or (".png" if "image" in m.document.mime_type else ".mp4")
+        else:
+            return await m.answer("Нужна картинка или видео. Пришлите файл ещё раз или откройте другой раздел меню.")
+        if (getattr(file, "file_size", 0) or 0) > 20 * 1024 * 1024:
+            return await m.answer("Файл больше 20 МБ — Telegram не даст боту его скачать. Пришлите поменьше.")
+        await state.clear()
+        for old in self.app.overlay_dir().glob(f"{key}.*"):
+            old.unlink(missing_ok=True)
+        dest = self.app.overlay_dir() / f"{key}{ext}"
+        await self.bot.download(file, destination=dest)
+        who = "общая заставка" if key == "_default" else f"заставка для {html.escape(key)}"
+        hint = ("Включите режим «заставка» в ⚙️ Настройках (по умолчанию) или в карточке канала."
+                if key == "_default" else "Включите для канала режим «заставка» в его карточке.")
+        log.info("🖼  сохранена %s: %s", who, dest.name)
+        await m.answer(f"✅ Сохранена {who}. {hint}", reply_markup=MAIN_KB)
 
     async def in_limit(self, m: Message, state: FSMContext):
         try:
