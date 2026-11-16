@@ -19,6 +19,7 @@ from aiogram.types import (CallbackQuery, FSInputFile, InlineKeyboardButton, Inl
                            KeyboardButton, Message, ReplyKeyboardMarkup)
 
 from .db import day_start
+from .version import full_version
 
 log = logging.getLogger(__name__)
 
@@ -209,7 +210,8 @@ class BotUI:
         async def start(m: Message, state: FSMContext):
             if self.owner_id and m.from_user.id == self.owner_id:
                 await state.clear()
-                await m.answer("Готов к работе. Меню внизу экрана.", reply_markup=MAIN_KB)
+                await m.answer(f"Готов к работе. Меню внизу экрана.\n🏷 Версия {html.escape(full_version())}",
+                               reply_markup=MAIN_KB)
             elif not self.owner_id:
                 await m.answer(f"Ваш Telegram ID: <code>{m.from_user.id}</code>\n"
                                "Впишите его в .env как TELEGRAM_OWNER_ID и перезапустите программу.")
@@ -984,7 +986,8 @@ class BotUI:
                  f"Сегодня: {s['cand_today']} кандидатов → {s['approved_today']} одобрено → {s['posted_today']} выложено",
                  f"Диск: {s['free_gb']:.0f} ГБ свободно · API сегодня: {s['spend_today']:.1f} ₽" +
                  (f" из {limit:.0f} ₽" if limit else ""),
-                 f"Кодировщик: {s['encoder']}"]
+                 f"Кодировщик: {s['encoder']}",
+                 f"🏷 Версия {html.escape(full_version())}"]
         if warn:
             lines.append("⚠️ " + "; ".join(warn))
         return "\n".join(lines)

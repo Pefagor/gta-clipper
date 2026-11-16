@@ -61,6 +61,8 @@ async def cmd_run(cfg, extra_channels: list[str]) -> None:
     else:
         logging.warning("TELEGRAM_BOT_TOKEN не задан: бот выключен, клипы будут копиться в data/candidates")
     await app.start()
+    from .version import full_version
+    logging.info("🏷  gta-clipper %s", full_version())
     logging.info("▶️  программа запущена. Каналы: %s", ", ".join(c["login"] for c in app.db.channels()) or "нет")
     try:
         if app.bot:
@@ -75,6 +77,8 @@ async def cmd_doctor(cfg) -> int:
     from .tools import find_ffmpeg, find_ffprobe, pick_encoder, _has_libass
 
     ok = True
+    from .version import full_version
+    print(f"🏷  gta-clipper {full_version()}")
 
     def line(good: bool, text: str):
         nonlocal ok
