@@ -174,23 +174,100 @@ def find_cam(paths: list[str]) -> dict:
 
 
 def check_cam(rect: list[float], paths: list[str]) -> dict:
-    """Есть ли лицо внутри сохранённой рамки вебки хотя бы на одном кадре."""
+    """Вебка всё ещё на месте? Да, если хорошо видны края рамки (стример может отвернуться или закрыть
+    лицо — вебка-то на месте) или есть лицо и края хоть немного видны. Нет — если раскладка сменилась."""
     import cv2
-    hits = 0
+    hits, imgs = 0, []
     det = None
     for p in paths:
         img = cv2.imread(p)
         if img is None:
             continue
+        imgs.append(img)
         h, w = img.shape[:2]
-        det = det or _detector(w, h, conf=0.7)
+        det = det or _detector(w, h, conf=0.6)
         x, y, rw, rh = rect[0] * w, rect[1] * h, rect[2] * w, rect[3] * h
         for f in detect_faces(img, det):
             fcx, fcy = f[0] + f[2] / 2, f[1] + f[3] / 2
-            if x <= fcx <= x + rw and y <= fcy <= y + rh:
+            # лицо в вебке соразмерно ей; мелкие «лица» — детали игры
+            if x <= fcx <= x + rw and y <= fcy <= y + rh and f[2] >= 0.1 * rw:
                 hits += 1
                 break
-    return {"present": hits > 0, "hits": hits}
+    border = border_support(rect, imgs) if imgs else 0.0
+    # края хорошо видны — вебка на месте; лицо без краёв может оказаться персонажем игры
+    present = border >= 0.45 or (hits > 0 and border >= 0.2)
+    return {"present": present, "hits": hits, "border": round(border, 2)}
+
+
+def border_support(rect: list[float], imgs: list) -> float:
+    """Насколько края рамки видны как линии на кадрах (0..1). Стороны по краю кадра не считаются."""
+    import cv2
+    h, w = imgs[0].shape[:2]
+    E = edge_persistence([cv2.cvtColor(i, cv2.COLOR_BGR2GRAY) for i in imgs])
+    L, T = int(rect[0] * w), int(rect[1] * h)
+    R, B = min(w - 1, int((rect[0] + rect[2]) * w)), min(h - 1, int((rect[1] + rect[3]) * h))
+    sides = []
+    for at, vertical in ((L, True), (R, True), (T, False), (B, False)):
+        limit = w if vertical else h
+        if at <= 2 or at >= limit - 3:
+            continue
+        lo, hi = max(0, at - 2), at + 3
+        band = E[T:B, lo:hi].max(axis=1) if vertical else E[lo:hi, L:R].max(axis=0)
+        sides.append(float((band >= 0.3).mean()) if band.size else 0.0)
+    return float(np.mean(sides)) if sides else 0.0
+
+
+def match_template(template: str, paths: list[str]) -> dict:
+    """Рамка вебки по присланной пользователем вырезке (скриншот вебки): ищем её в кадрах стрима
+    на разных масштабах — скриншот с телефона другого размера, чем исходник 1080p."""
+    import cv2
+    tmpl0 = cv2.imread(template, cv2.IMREAD_GRAYSCALE)
+    frames = [f for f in (cv2.imread(p, cv2.IMREAD_GRAYSCALE) for p in paths) if f is not None]
+    if tmpl0 is None or not frames:
+        return {"rect": None, "error": "нет картинки или кадров"}
+    h, w = frames[0].shape[:2]
+    th0, tw0 = tmpl0.shape[:2]
+    ratio = th0 / tw0
+
+    def best_at(frame, tw: int, region=None):
+        th = int(round(tw * ratio))
+        if tw < 16 or th < 16 or tw > frame.shape[1] or th > frame.shape[0]:
+            return -1.0, (0, 0)
+        tmpl = cv2.resize(tmpl0, (tw, th), interpolation=cv2.INTER_AREA)
+        area = frame if region is None else frame[region[1]:region[3], region[0]:region[2]]
+        if area.shape[0] < th or area.shape[1] < tw:
+            return -1.0, (0, 0)
+        res = cv2.matchTemplate(area, tmpl, cv2.TM_CCOEFF_NORMED)
+        _, mx, _, loc = cv2.minMaxLoc(res)
+        off = (0, 0) if region is None else (region[0], region[1])
+        return float(mx), (loc[0] + off[0], loc[1] + off[1])
+
+    # 1) грубо: кадр в половину размера, ширина вебки от 5% до 75% кадра
+    k = 0.5
+    small = [cv2.resize(f, (int(w * k), int(h * k)), interpolation=cv2.INTER_AREA) for f in frames]
+    best = (-1.0, 0, (0, 0))
+    for tw_full in np.geomspace(0.05 * w, 0.75 * w, 48):
+        for f in small:
+            sc, loc = best_at(f, int(tw_full * k))
+            if sc > best[0]:
+                best = (sc, int(tw_full), (int(loc[0] / k), int(loc[1] / k)))
+    # 2) точно: полный размер, масштаб ±6% с шагом 1%, только около найденного места
+    sc0, tw0_full, (x0, y0) = best
+    best_full = (sc0, tw0_full, (x0, y0))
+    pad = int(0.1 * tw0_full) + 8
+    for tw in np.linspace(tw0_full * 0.94, tw0_full * 1.06, 13):
+        th = int(round(tw * ratio))
+        region = (max(0, x0 - pad), max(0, y0 - pad), min(w, x0 + int(tw) + pad), min(h, y0 + th + pad))
+        for f in frames:
+            sc, loc = best_at(f, int(tw), region)
+            if sc > best_full[0]:
+                best_full = (sc, int(tw), loc)
+    sc, tw, (x, y) = best_full
+    if sc < 0.45:
+        return {"rect": None, "score": round(sc, 3), "error": "вырезка не найдена в кадре стрима"}
+    th = int(round(tw * ratio))
+    return {"rect": [round(x / w, 4), round(y / h, 4), round(tw / w, 4), round(th / h, 4)],
+            "method": "template", "score": round(sc, 3)}
 
 
 def draw_preview(src: str, out: str, rect: list[float] | None, color=(0, 255, 0)) -> None:
@@ -216,6 +293,11 @@ def main() -> None:
     elif mode == "check":
         rect = [float(v) for v in sys.argv[2:6]]
         res = check_cam(rect, sys.argv[6:])
+    elif mode == "match":  # match вырезка.jpg preview.jpg кадр1.jpg ...
+        tmpl, out, frames = sys.argv[2], sys.argv[3], sys.argv[4:]
+        res = match_template(tmpl, frames)
+        if frames:
+            draw_preview(frames[-1], out, res.get("rect"))
     elif mode == "draw":  # draw src out x y w h
         draw_preview(sys.argv[2], sys.argv[3], [float(v) for v in sys.argv[4:8]])
         res = {"ok": True}

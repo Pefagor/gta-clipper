@@ -48,6 +48,7 @@ class Input(StatesGroup):
     hashtags = State()
     limit = State()
     overlay = State()
+    cam_template = State()
 
 
 class Owner(BaseFilter):
@@ -84,9 +85,36 @@ def game_meta(game: str | None, games: dict) -> tuple[str, str]:
     return short, tags
 
 
-def adjust_rect(rect: list[float], op: str, move: float = 0.01, grow: float = 0.05) -> list[float]:
-    """Сдвиг/размер рамки вебки (доли кадра); рамка остаётся внутри кадра."""
+def adjust_rect(rect: list[float], op: str, move: float = 0.01, grow: float = 0.05,
+                edge: float = 0.004) -> list[float]:
+    """Сдвиг/размер рамки вебки (доли кадра); рамка остаётся внутри кадра.
+
+    Отдельные края (шаг edge ≈ 8 пикс по ширине 1080p): Ll/Lr — левый край влево/вправо,
+    Rl/Rr — правый, Tu/Td — верхний вверх/вниз, Bu/Bd — нижний."""
     x, y, w, h = rect
+    r, b = x + w, y + h
+    if op in ("Ll", "Lr", "Rl", "Rr", "Tu", "Td", "Bu", "Bd"):
+        step = edge if op[0] in "LR" else edge * 16 / 9  # одинаковый шаг в пикселях по обеим осям
+        if op == "Ll":
+            x -= step
+        elif op == "Lr":
+            x += step
+        elif op == "Rl":
+            r -= step
+        elif op == "Rr":
+            r += step
+        elif op == "Tu":
+            y -= step
+        elif op == "Td":
+            y += step
+        elif op == "Bu":
+            b -= step
+        elif op == "Bd":
+            b += step
+        x, y, r, b = max(0.0, x), max(0.0, y), min(1.0, r), min(1.0, b)
+        if r - x < 0.03 or b - y < 0.03:
+            return [round(v, 4) for v in rect]
+        return [round(x, 4), round(y, 4), round(r - x, 4), round(b - y, 4)]
     if op == "l":
         x -= move
     elif op == "r":
@@ -201,6 +229,7 @@ class BotUI:
         r.message.register(self.in_hashtags, Input.hashtags)
         r.message.register(self.in_limit, Input.limit)
         r.message.register(self.in_overlay, Input.overlay)
+        r.message.register(self.in_cam_template, Input.cam_template)
         r.callback_query.register(self.cb, F.data)
         self.dp.include_router(public)
         self.dp.include_router(r)
@@ -656,6 +685,8 @@ class BotUI:
                 [("🖼 Своя заставка", f"ch:ovl:{login}")]]
         if mode == "auto":
             rows[1].insert(0, ("🎯 Найти вебку", f"ch:cam:{login}"))
+            rows.insert(2, [("📸 Вебка по скриншоту", f"cam:tpl:{login}")]
+                        + ([("✏️ Подправить рамку", f"cam:adjnew:{login}")] if self.db.kv_get(f"cam:{login}") else []))
         if self.app.overlay_path(login):
             rows[1].append(("🗑 Убрать заставку", f"ch:ovldel:{login}"))
         rows.append([("🗑 Удалить", f"ch:del:{login}"), ("← Назад", "ch:list:0")])
@@ -735,11 +766,16 @@ class BotUI:
     # ================= вебка =================
     def _cam_kb(self, login: str, rect) -> InlineKeyboardMarkup:
         rows = [[("✅ Верно", f"cam:ok:{login}"), ("✏️ Подправить", f"cam:adj:{login}")]] if rect else []
+        rows.append([("📸 Прислать вырезку вебки", f"cam:tpl:{login}")])
         rows.append([("🔄 Искать снова", f"cam:retry:{login}"), ("🚫 Без вебки", f"cam:none:{login}")])
         return kb(rows)
 
     def _cam_adjust_kb(self, login: str) -> InlineKeyboardMarkup:
         return kb([[("⬅️", f"cm:l:{login}"), ("⬆️", f"cm:u:{login}"), ("⬇️", f"cm:d:{login}"), ("➡️", f"cm:r:{login}")],
+                   [("◀ левый", f"cm:Ll:{login}"), ("левый ▶", f"cm:Lr:{login}"),
+                    ("◀ правый", f"cm:Rl:{login}"), ("правый ▶", f"cm:Rr:{login}")],
+                   [("▲ верх", f"cm:Tu:{login}"), ("верх ▼", f"cm:Td:{login}"),
+                    ("▲ низ", f"cm:Bu:{login}"), ("низ ▼", f"cm:Bd:{login}")],
                    [("↔️ шире", f"cm:w+:{login}"), ("↔️ уже", f"cm:w-:{login}"),
                     ("↕️ выше", f"cm:h+:{login}"), ("↕️ ниже", f"cm:h-:{login}")],
                    [("✅ Готово", f"cam:ok:{login}"), ("← Назад", f"cm:back:{login}")]])
@@ -751,7 +787,9 @@ class BotUI:
         if method == "estimate":
             return (f"🎥 <b>{name}</b>: нашёл лицо, но края вебки не видны — рамка примерная (жёлтая). "
                     "Проверьте и при необходимости подправьте.")
-        return f"🎥 <b>{name}</b>: вебка здесь? (зелёная рамка)"
+        return (f"🎥 <b>{name}</b>: вебка здесь? (зелёная рамка)\n"
+                "Пока вы не ответили, клипы уже монтируются с этой рамкой. Если она шире вебки — "
+                "«✏️ Подправить» (каждый край отдельно) или «📸 Прислать вырезку вебки».")
 
     async def send_cam_proposal(self, login: str, photo: Path | None, rect, method: str | None = None) -> None:
         if not self.owner_id:
@@ -783,10 +821,52 @@ class BotUI:
             return await q.answer("Ищу снова")
         elif action == "adj":
             await self._safe(q.message.edit_reply_markup(reply_markup=self._cam_adjust_kb(login)))
+        elif action == "adjnew":  # подстройка из карточки канала — присылаем кадр с текущей рамкой
+            rect = self.db.kv_get(f"cam:{login}")
+            photo = await self.app.draw_cam_preview(login, rect) if rect else None
+            if not photo:
+                return await q.answer("Нет сохранённого кадра — канал ещё не был в эфире", show_alert=True)
+            await self.bot.send_photo(self.owner_id, FSInputFile(photo), reply_markup=self._cam_adjust_kb(login),
+                                      caption="🎥 Подстройка рамки. Края двигаются по 8 пикселей. «Готово» — сохранить.")
+        elif action == "tpl":
+            await state.set_state(Input.cam_template)
+            await state.update_data(login=login)
+            await q.message.answer(
+                "📸 Сделайте скриншот стрима, обрежьте его на телефоне ровно по краям вебки и пришлите сюда "
+                "картинкой. Программа найдёт эту вырезку в кадре стрима и поставит рамку точно по ней.")
         await self._safe(q.answer())
 
+    async def in_cam_template(self, m: Message, state: FSMContext):
+        data = await state.get_data()
+        login = data.get("login")
+        if m.photo:
+            file = m.photo[-1]
+        elif m.document and (m.document.mime_type or "").startswith("image/"):
+            file = m.document
+        else:
+            return await m.answer("Нужна картинка — вырезка вебки со скриншота. Пришлите ещё раз.")
+        await state.clear()
+        work = self.app.cfg.data_dir / "cam" / login
+        work.mkdir(parents=True, exist_ok=True)
+        tmpl = work / "template.jpg"
+        await self.bot.download(file, destination=tmpl)
+        await m.answer("🔎 Ищу эту вырезку в кадре стрима…")
+        photo, res = await self.app.match_cam_template(login, tmpl)
+        name = html.escape((self.db.channel(login) or {}).get("display_name") or login)
+        if not res.get("rect"):
+            return await m.answer(f"❌ Не нашёл вырезку в кадре {name}: {html.escape(str(res.get('error', ''))[:200])}. "
+                                  "Проверьте, что раскладка стрима сейчас та же, и обрежьте точнее по краям вебки.",
+                                  reply_markup=MAIN_KB)
+        caption = (f"🎥 <b>{name}</b>: рамка по вашей вырезке (совпадение {res.get('score', 0):.0%}). "
+                   "Пока вы не ответили, клипы уже монтируются с ней.")
+        if photo:
+            await self.bot.send_photo(self.owner_id, FSInputFile(photo), caption=caption,
+                                      reply_markup=self._cam_kb(login, res["rect"]))
+        else:
+            await m.answer(caption, reply_markup=self._cam_kb(login, res["rect"]))
+
     async def cb_cm(self, q, state, action, arg, parts):
-        """Ручная подстройка рамки вебки: сдвиг на 1% кадра, размер на 5%."""
+        """Ручная подстройка рамки вебки: сдвиг на 1% кадра, размер на 5%, отдельные края на ~8 пикс."""
         login = arg
         rect = self.db.kv_get(f"cam:{login}")
         if not rect:

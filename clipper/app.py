@@ -211,11 +211,6 @@ class App:
                 self.offline_checks[login] = 0
                 if not rec and ch["state"] == "active":
                     await self._start_recording(login)
-                elif (rec and rec.healthy and ch["cam_status"] == "unknown" and self.cam_mode(login) == "auto"
-                      and time.time() - rec.started_at > 60
-                      and time.time() >= (self.db.kv_get(f"cam_next:{login}") or 0)):
-                    self.db.update_channel(login, cam_status="pending")
-                    self.spawn(self.calibrate_cam(login))
             else:
                 if ch["state"] == "removing" and not rec:
                     self.db.update_channel(login, state="removed", removed_at=time.time())
@@ -274,6 +269,7 @@ class App:
                     det = self.detectors[login]
                     score, signals = det.tick(now, self.chat.history(login), rec.audio, list(self.clip_moments[login]))
                     self._status_line(login, rec, score, signals, thr)
+                    self._maybe_calibrate(login, rec, now)
                     win = self.open_windows.get(login)
                     if score >= thr or signals.get("rage"):
                         # момент «по звуку» привязан к секунде крика, по чату — к «сейчас минус задержка чата»
@@ -519,7 +515,7 @@ class App:
         start, end = max(0.0, start), min(info["duration"] or c["raw_duration"], end)
         ch = self.db.channel(c["channel"]) or {}
         mode = self.cam_mode(c["channel"])
-        cam = (ch["cam_x"], ch["cam_y"], ch["cam_w"], ch["cam_h"]) if ch.get("cam_status") == "ok" else None
+        cam = self.cam_rect(c["channel"], ch)
         top_media = None
         if mode == "off":
             cam = None
@@ -549,7 +545,7 @@ class App:
     async def _cam_present(self, raw: Path, d: Path, cam, start: float, end: float) -> bool:
         if not self.cfg.section("render").get("check_cam", True):
             return True
-        frames = await extract_frames(self.ffmpeg, raw, d, spread(end - start, 4, None, None), "cam", scale=None,
+        frames = await extract_frames(self.ffmpeg, raw, d, spread(end - start, 8, None, None), "cam", scale=None,
                                       offset=start)
         if not frames:
             return True
@@ -622,7 +618,7 @@ class App:
         except Exception:  # noqa: BLE001
             log.exception("[%s] поиск вебки", login)
         # не получилось — попробуем снова через 5 минут
-        self.db.kv_set(f"cam_next:{login}", time.time() + 300)
+        self.db.kv_set(f"cam_next:{login}", time.time() + 120)
         ch = self.db.channel(login)
         if ch and ch["cam_status"] == "pending":
             self.db.update_channel(login, cam_status="unknown")
@@ -678,6 +674,68 @@ class App:
         else:
             self.accept_cam(login, None)
         return True
+
+    def _maybe_calibrate(self, login: str, rec: Recorder, now: float) -> None:
+        """Искать вебку, как только накопилось ~35 с записи (8+ сегментов), а не через минуту."""
+        if now - rec.started_at < 35 or now < (self.db.kv_get(f"cam_next:{login}") or 0):
+            return
+        ch = self.db.channel(login)
+        if ch and ch["cam_status"] == "unknown" and self.cam_mode(login) == "auto":
+            self.db.update_channel(login, cam_status="pending")
+            self.spawn(self.calibrate_cam(login))
+
+    def cam_rect(self, login: str, ch: dict | None = None):
+        """Рамка вебки для монтажа. Пока вы не ответили в боте, используется уже найденная по краям или
+        по вырезке рамка — иначе клипы до подтверждения монтировались бы без вебки."""
+        ch = ch or self.db.channel(login) or {}
+        if ch.get("cam_status") == "ok":
+            return ch["cam_x"], ch["cam_y"], ch["cam_w"], ch["cam_h"]
+        if ch.get("cam_status") == "pending" and self.db.kv_get(f"cam_method:{login}") in ("edges", "template", "manual"):
+            rect = self.db.kv_get(f"cam:{login}")
+            if rect:
+                return tuple(rect)
+        return None
+
+    async def grab_frames(self, login: str, n: int = 3) -> list[Path]:
+        """Свежие кадры канала: из идущей записи, иначе — сохранённый кадр последнего поиска вебки."""
+        work = self.cfg.data_dir / "cam" / login
+        work.mkdir(parents=True, exist_ok=True)
+        rec = self.recorders.get(login)
+        frames: list[Path] = []
+        if rec:
+            segs = (await asyncio.to_thread(load_session_segments, rec.session_dir))[-12:]
+            for i, sgm in enumerate(segs[:: max(1, len(segs) // n)][:n]):
+                p = work / f"g{i}.jpg"
+                code, _ = await run([self.ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-i", str(sgm.path),
+                                     "-frames:v", "1", "-q:v", "3", str(p)], timeout=60)
+                if code == 0 and p.exists():
+                    frames.append(p)
+        if not frames and (work / "base.jpg").exists():
+            frames = [work / "base.jpg"]
+        return frames
+
+    async def match_cam_template(self, login: str, template: Path) -> tuple[Path | None, dict]:
+        """Рамка по присланной вырезке вебки. Возвращает (кадр с рамкой, результат)."""
+        frames = await self.grab_frames(login)
+        if not frames:
+            return None, {"rect": None, "error": "нет кадров: канал не в эфире и ещё ни разу не записывался"}
+        work = self.cfg.data_dir / "cam" / login
+        preview = work / "preview.jpg"
+        code, out = await run([sys.executable, "-m", "clipper.camcal", "match", str(template), str(preview),
+                               *map(str, frames)], timeout=180)
+        try:
+            res = json.loads(out.strip().splitlines()[-1]) if code == 0 else {"rect": None, "error": out[-300:]}
+        except (ValueError, IndexError):
+            res = {"rect": None, "error": out[-300:]}
+        if res.get("rect"):
+            if frames[-1] != work / "base.jpg":
+                shutil.copy(frames[-1], work / "base.jpg")
+            self.db.kv_set(f"cam:{login}", res["rect"])
+            self.db.kv_set(f"cam_method:{login}", "template")
+            if (self.db.channel(login) or {}).get("cam_status") != "ok":
+                self.db.update_channel(login, cam_status="pending")
+            log.info("🎥 [%s] вебка найдена по присланной вырезке (совпадение %.2f)", login, res.get("score", 0))
+        return (preview if preview.exists() else None), res
 
     async def draw_cam_preview(self, login: str, rect) -> Path | None:
         """Перерисовывает рамку на сохранённом кадре (для ручной подстройки)."""

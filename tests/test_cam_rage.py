@@ -58,6 +58,15 @@ def test_find_cam_real_stream(tmp_path, folder):
     assert abs(x - 0.793) < 0.01 and y < 0.01 and abs(x + w - 1.0) < 0.01 and abs(y + h - 0.264) < 0.01
 
 
+def test_adjust_single_edges():
+    r = [0.7, 0.0, 0.3, 0.3]
+    x, y, w, h = adjust_rect(r, "Lr")            # левый край вправо — правый край на месте
+    assert x > 0.7 and abs((x + w) - 1.0) < 1e-6
+    x, y, w, h = adjust_rect(r, "Bu")            # нижний край вверх — верх на месте
+    assert y == 0.0 and h < 0.3
+    assert adjust_rect(r, "Rr") == [0.7, 0.0, 0.3, 0.3]   # правый край уже у края кадра
+
+
 def test_adjust_rect_stays_inside_frame():
     assert adjust_rect([0.0, 0.0, 0.2, 0.2], "l") == [0.0, 0.0, 0.2, 0.2]
     assert adjust_rect([0.5, 0.5, 0.2, 0.2], "r") == [0.51, 0.5, 0.2, 0.2]
@@ -99,3 +108,21 @@ def test_loud_events_and_marks():
     assert len(ev) == 1 and ev[0]["start"] == 12.0 and ev[0]["end"] == 14.0 and ev[0]["over_db"] >= 15
     text = transcript_text({"segments": [{"start": 11.0, "text": "да ну нет"}], "loud": ev})
     assert text.splitlines()[1].startswith("[12.0] (КРИК")
+
+
+@pytest.mark.skipif(not LOCAL.exists(), reason="кадры реального стрима есть только локально (не в git)")
+def test_template_match_and_check_real_stream(tmp_path):
+    """Вырезка вебки «со скриншота телефона» (уменьшена и пережата) находится в других кадрах стрима;
+    проверка перед монтажом отличает настоящую вебку от пустого места в игре."""
+    import cv2
+    from clipper.camcal import check_cam, match_template
+    frames = sorted(map(str, LOCAL.glob("*.jpg")))
+    img = cv2.imread(frames[5])
+    crop = cv2.resize(img[0:285, 1522:1920], None, fx=0.55, fy=0.55)
+    tmpl = tmp_path / "tmpl.jpg"
+    cv2.imwrite(str(tmpl), crop, [cv2.IMWRITE_JPEG_QUALITY, 60])
+    res = match_template(str(tmpl), frames[12:15])
+    x, y, w, h = res["rect"]
+    assert abs(x - 0.7927) < 0.005 and y < 0.005 and abs(w - 0.2073) < 0.01 and abs(h - 0.2639) < 0.01
+    assert check_cam([0.7927, 0.0, 0.2068, 0.2639], frames[:8])["present"] is True
+    assert check_cam([0.35, 0.35, 0.2, 0.26], frames[:8])["present"] is False
