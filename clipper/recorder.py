@@ -32,6 +32,7 @@ class Recorder:
         self.on_alert = on_alert
         self.audio: deque[tuple[float, float]] = deque(maxlen=4 * 3600)  # (время, громкость дБ) каждые 0.5 с
         self.started_at = time.time()
+        self.game = ""  # категория Twitch, обновляется наблюдателем
         self.part = 0
         self.restarts = 0
         self.stop_requested = False

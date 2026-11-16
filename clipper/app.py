@@ -64,7 +64,7 @@ class App:
         self.clip_moments: dict[str, deque] = defaultdict(lambda: deque(maxlen=200))
         self.seen_clips: set[str] = set()
         self.offline_checks: dict[str, int] = defaultdict(int)
-        self.live: set[str] = set()
+        self.live: dict[str, dict] = {}  # логин -> {"game", "title"}
         self.wake = asyncio.Event()
         self.bot = None  # BotUI, если задан токен Telegram
         self._alerted: dict[str, float] = {}
@@ -194,7 +194,13 @@ class App:
         for login in list(self.recorders):
             if login not in chans:
                 await self._stop_recording(login)
-        self.live = await self.twitch.live_logins(list(chans))
+        self.live = await self.twitch.live_info(list(chans))
+        for login, info in self.live.items():
+            rec = self.recorders.get(login)
+            if rec and info.get("game") and info["game"] != rec.game:
+                if rec.game:
+                    log.info("🎮 [%s] сменил игру: %s → %s", login, rec.game, info["game"])
+                rec.game = info["game"]
         for login, ch in chans.items():
             rec = self.recorders.get(login)
             if rec and not rec.running:  # задача записи умерла — перезапускаем
@@ -306,6 +312,7 @@ class App:
         start, end = plan_window(peak, dcfg)
         start = max(start, rec.started_at, self.last_end.get(login, 0) if track else 0)
         cid = self.db.add_candidate(channel=login, session_id=rec.session_id, status="to_cut", trigger=trigger,
+                                    game=rec.game or None,
                                     peak_ts=peak, win_start=start, win_end=end, score=score, signals=signals,
                                     next_try_at=end + seg + 3)
         if track:
@@ -434,7 +441,7 @@ class App:
         chat = [(t - t0, m) for t, m in self.chat.window(c["channel"], t0, t0 + dur)]
         if not chat and t0 < self._started_at:  # окно до перезапуска программы — читаем лог сессии
             chat = await asyncio.to_thread(self._chat_from_log, c, t0, dur)
-        return build_context(c["channel"], transcript_text(tr), chat, c.get("signals") or {},
+        return build_context(c["channel"], c.get("game") or "", transcript_text(tr), chat, c.get("signals") or {},
                              c["peak_ts"] - t0, dur, screen)
 
     def _chat_from_log(self, c: dict, t0: float, dur: float) -> list[tuple[float, str]]:
@@ -546,15 +553,17 @@ class App:
             return True  # проверка сломалась — не портим клип, оставляем вебку
 
     # ---------- подборки ----------
-    def compilation_tags(self) -> list[tuple[str, int]]:
-        rows = self.db.all("SELECT tag, COUNT(*) n FROM candidates WHERE kind='clip' AND status IN ('approved','sent','done') "
-                           "AND in_compilation=0 AND tag IS NOT NULL AND tag!='' GROUP BY tag ORDER BY n DESC")
+    def compilation_tags(self) -> list[tuple[str, str, int]]:
+        """Темы для подборок: (игра, тема, сколько клипов) — клипы разных игр не смешиваются."""
+        rows = self.db.all("SELECT COALESCE(game,'') g, tag, COUNT(*) n FROM candidates WHERE kind='clip' "
+                           "AND status IN ('approved','sent','done') AND in_compilation=0 AND tag IS NOT NULL "
+                           "AND tag!='' GROUP BY g, tag ORDER BY n DESC")
         need = int(self.cfg.section("compilation").get("min_clips", 3))
-        return [(r["tag"], r["n"]) for r in rows if r["n"] >= need]
+        return [(r["g"], r["tag"], r["n"]) for r in rows if r["n"] >= need]
 
-    def create_compilation(self, tag: str) -> int | None:
+    def create_compilation(self, game: str, tag: str) -> int | None:
         rows = self.db.all("SELECT * FROM candidates WHERE kind='clip' AND status IN ('approved','sent','done') "
-                           "AND in_compilation=0 AND tag=? ORDER BY score DESC", (tag,))
+                           "AND in_compilation=0 AND tag=? AND COALESCE(game,'')=? ORDER BY score DESC", (tag, game))
         max_s = float(self.cfg.section("compilation").get("max_seconds", 90))
         picked, total = [], 0.0
         for r in rows:
@@ -567,7 +576,7 @@ class App:
         picked.sort(key=lambda r: r["id"])
         streamers = sorted({r["channel"] for r in picked})
         title = f"{tag.capitalize()}: {len(streamers)} стрим." if len(streamers) > 1 else tag.capitalize()
-        cid = self.db.add_candidate(kind="compilation", channel=",".join(streamers), status="to_render",
+        cid = self.db.add_candidate(kind="compilation", channel=",".join(streamers), status="to_render", game=game or None,
                                     parts=[r["id"] for r in picked], title=title, titles=[title], tag=tag,
                                     category="подборка", score=max(r["score"] or 0 for r in picked),
                                     description="Стримеры: " + ", ".join(f"twitch.tv/{s}" for s in streamers))

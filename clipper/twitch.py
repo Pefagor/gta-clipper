@@ -55,35 +55,45 @@ class TwitchAPI:
         data = await self._get("users", {"login": login})
         return data[0] if data else None
 
-    async def live_logins(self, logins: list[str]) -> set[str]:
-        """Какие из каналов сейчас в эфире."""
+    async def live_info(self, logins: list[str]) -> dict[str, dict]:
+        """Каналы, которые сейчас в эфире: {логин: {"game": категория Twitch, "title": название стрима}}."""
         if not logins:
-            return set()
+            return {}
         if not self.enabled:
             results = await asyncio.gather(*(self._streamlink_live(l) for l in logins))
-            return {l for l, ok in zip(logins, results) if ok}
-        live: set[str] = set()
+            return {l: info for l, info in zip(logins, results) if info is not None}
+        live: dict[str, dict] = {}
         for i in range(0, len(logins), 100):
             data = await self._get("streams", [("user_login", l) for l in logins[i:i + 100]])
-            live |= {s["user_login"].lower() for s in data if s.get("type") == "live"}
+            for s in data:
+                if s.get("type") == "live":
+                    live[s["user_login"].lower()] = {"game": s.get("game_name") or "", "title": s.get("title") or ""}
         return live
 
-    async def _streamlink_live(self, login: str) -> bool:
+    async def live_logins(self, logins: list[str]) -> set[str]:
+        return set(await self.live_info(logins))
+
+    async def _streamlink_live(self, login: str) -> dict | None:
+        """None — не в эфире; иначе метаданные стрима (streamlink отдаёт категорию без ключей Twitch)."""
         try:
             proc = await asyncio.create_subprocess_exec(
                 *self.streamlink, "--json", f"https://twitch.tv/{login}",
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
         except OSError:
-            return False
+            return None
         try:
             out, _ = await asyncio.wait_for(proc.communicate(), 40)
-            return bool(json.loads(out or b"{}").get("streams"))
+            data = json.loads(out or b"{}")
         except asyncio.TimeoutError:
             proc.kill()
             await proc.wait()
-            return False
+            return None
         except ValueError:
-            return False
+            return None
+        if not data.get("streams"):
+            return None
+        meta = data.get("metadata") or {}
+        return {"game": meta.get("category") or "", "title": meta.get("title") or ""}
 
     async def recent_clips(self, broadcaster_id: str, since: float) -> list[dict]:
         started = datetime.fromtimestamp(since, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")

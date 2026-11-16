@@ -42,7 +42,7 @@ CREATE TABLE IF NOT EXISTS candidates (
     clip_start REAL, clip_end REAL,
     edit_start REAL, edit_end REAL,
     titles TEXT, title TEXT, description TEXT,
-    category TEXT, tag TEXT, spoiler INTEGER DEFAULT 0,
+    category TEXT, tag TEXT, spoiler INTEGER DEFAULT 0, game TEXT,
     render_path TEXT, render_duration REAL,
     parts TEXT,
     error TEXT,
@@ -75,6 +75,13 @@ class DB:
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.executescript(SCHEMA)
+        self._migrate()
+
+    def _migrate(self) -> None:
+        """Новые колонки в уже существующей базе."""
+        cols = {r[1] for r in self.conn.execute("PRAGMA table_info(candidates)")}
+        if "game" not in cols:
+            self.conn.execute("ALTER TABLE candidates ADD COLUMN game TEXT")
 
     # --- низкий уровень ---
     def execute(self, sql: str, params: tuple | list = ()) -> sqlite3.Cursor:

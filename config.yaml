@@ -79,6 +79,15 @@ defaults:                    # стартовые значения настро�
   per_day: 10
   interval_hours: 1.5
   publish_mode: schedule     # schedule | now
-  hashtags: "#gta6 #гта6"
+  hashtags: ""               # общие хэштеги для всех клипов; хэштеги игры — в разделе games ниже
   quiet: false
   api_daily_limit_rub: 0     # 0 = без лимита
+
+# Игры: короткое название для заголовка Shorts («… | GTA 6») и хэштеги. Название — как категория на Twitch.
+# Для игр, которых здесь нет, берётся название категории и хэштег из него (Dota 2 → #dota2).
+games:
+  "Grand Theft Auto VI": {short: "GTA 6", tags: "#gta6 #гта6"}
+  "Grand Theft Auto V": {short: "GTA 5", tags: "#gta5 #гта5"}
+  "Dota 2": {short: "Dota 2", tags: "#dota2 #дота2"}
+  "Counter-Strike": {short: "CS2", tags: "#cs2 #кс2"}
+  "Just Chatting": {short: "", tags: ""}

@@ -94,3 +94,23 @@ def test_unmute_after_silence_does_not_trigger():
 def test_llm_value_parsing():
     assert as_bool("false", True) is False and as_bool("да", False) is True and as_bool(None, True) is True
     assert as_score("8/10") == 8 and as_score(7.6) == 8 and as_score("15") == 10
+
+
+def test_compilations_do_not_mix_games(app):
+    for game in ("Dota 2", "Dota 2", "Dota 2", "Grand Theft Auto VI", "Grand Theft Auto VI"):
+        app.db.add_candidate(kind="clip", channel="x", status="approved", tag="смешной баг", game=game)
+    assert app.compilation_tags() == [("Dota 2", "смешной баг", 3)]
+
+
+def test_db_migration_adds_game_column(tmp_path):
+    import sqlite3
+    from clipper.db import DB
+    path = tmp_path / "old.db"
+    con = sqlite3.connect(path)
+    con.execute("CREATE TABLE candidates (id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT, channel TEXT, "
+                "status TEXT NOT NULL, created_at REAL, updated_at REAL)")
+    con.commit()
+    con.close()
+    db = DB(path)
+    db.add_candidate(channel="x", status="to_cut", game="Dota 2")
+    assert db.one("SELECT game FROM candidates")["game"] == "Dota 2"

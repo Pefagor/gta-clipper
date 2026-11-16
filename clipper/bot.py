@@ -67,6 +67,19 @@ def ago(ts: float | None) -> str:
     return f"{m} мин назад" if m < 60 else f"{m // 60} ч {m % 60} мин назад"
 
 
+def game_meta(game: str | None, games: dict) -> tuple[str, str]:
+    """(короткое название для заголовка Shorts, хэштеги игры). Из config.yaml → games, иначе по названию."""
+    if not game:
+        return "", ""
+    meta = games.get(game) or {}
+    short = meta["short"] if "short" in meta else game
+    tags = meta.get("tags")
+    if tags is None:  # #dota2 из «Dota 2»; для категорий вроде Just Chatting хэштег не нужен
+        slug = "".join(ch for ch in game.lower() if ch.isalnum())
+        tags = f"#{slug}" if slug and game not in ("Just Chatting", "Music", "IRL") else ""
+    return short, tags
+
+
 def adjust_rect(rect: list[float], op: str, move: float = 0.01, grow: float = 0.05) -> list[float]:
     """Сдвиг/размер рамки вебки (доли кадра); рамка остаётся внутри кадра."""
     x, y, w, h = rect
@@ -191,6 +204,8 @@ class BotUI:
         who = c["channel"] if c["kind"] == "clip" else "подборка: " + c["channel"]
         lines.append(f"📺 <b>{html.escape(who)}</b> · {CAT_ICON.get(cat, '🎬')} {html.escape(cat)} · {rating(c)}"
                      f" · 🕐 {ago(c.get('peak_ts') or c.get('created_at'))}")
+        if c.get("game"):
+            lines.append(f"🎮 {html.escape(c['game'])}")
         lines.append(f"«{html.escape(c.get('title') or '')}»")
         lines.append(f"⏱ {fmt_dur(c.get('render_duration'))} · В очереди ещё: {queue}")
         return "\n".join(lines)
@@ -415,13 +430,14 @@ class BotUI:
 
     # ================= публикация =================
     def _pkg_caption(self, c: dict) -> str:
-        tags = (self.app.setting("hashtags") or "")[:200]
+        short, game_tags = game_meta(c.get("game"), self.app.cfg.get("games") or {})
+        tags = " ".join(t for t in (game_tags, self.app.setting("hashtags") or "") if t)[:200]
         title = (c.get("title") or "Момент со стрима")[:90]
         if c["kind"] == "clip":
             credit = f"Стрим: twitch.tv/{c['channel']}"
         else:
             credit = (c.get("description") or "")[:250]
-        shorts_t = f"{title} | GTA 6"[:100]
+        shorts_t = (f"{title} | {short}" if short else title)[:100]
         shorts_d = f"{credit} {tags} #shorts".strip()
         tiktok = f"{title} {credit} {tags}".strip()
         done = []
@@ -508,8 +524,8 @@ class BotUI:
             if not tags:
                 need = self.app.cfg.section("compilation").get("min_clips", 3)
                 return await q.answer(f"Нужно хотя бы {need} одобренных клипа на одну тему", show_alert=True)
-            rows = [[(f"{t} ({n})", f"p:mk:{i}")] for i, (t, n) in enumerate(tags[:10])]
-            self.db.kv_set("comp_tags", [t for t, _ in tags[:10]])
+            rows = [[(f"{(g + ': ') if g else ''}{t} ({n})"[:60], f"p:mk:{i}")] for i, (g, t, n) in enumerate(tags[:10])]
+            self.db.kv_set("comp_tags", [[g, t] for g, t, _ in tags[:10]])
             await self._safe(q.message.edit_text("🎞 Выберите тему подборки:", reply_markup=kb(rows)))
             return await q.answer()
         if action == "mk":
@@ -517,10 +533,12 @@ class BotUI:
             idx = int(arg)
             if idx >= len(tags):
                 return await q.answer()
-            cid = self.app.create_compilation(tags[idx])
+            game, tag = tags[idx]
+            cid = self.app.create_compilation(game, tag)
             if not cid:
                 return await q.answer("Не хватает клипов", show_alert=True)
-            await self._safe(q.message.edit_text(f"🎞 Собираю подборку «{html.escape(tags[idx])}». "
+            await self._safe(q.message.edit_text(f"🎞 Собираю подборку «{html.escape(tag)}»"
+                                                 f"{' (' + html.escape(game) + ')' if game else ''}. "
                                                  "Она придёт на модерацию."))
             return await q.answer()
         cid = int(arg)
@@ -826,7 +844,8 @@ class BotUI:
             a.wake.set()
         elif action == "tags":
             await state.set_state(Input.hashtags)
-            await q.message.answer("Пришлите хэштеги через пробел, например: <code>#gta6 #гта6</code>")
+            await q.message.answer("Пришлите общие хэштеги через пробел, например: <code>#стрим #нарезка</code>.\n"
+                                   "Хэштеги игры добавляются сами (настраиваются в config.yaml, раздел games).")
             return await q.answer()
         elif action == "limit":
             await state.set_state(Input.limit)
