@@ -29,6 +29,13 @@ log = logging.getLogger(__name__)
 FINAL = ("rejected", "discarded", "failed", "done")
 
 
+def video_caption(c: dict) -> str:
+    """Надпись в начале видео: своя (overlay_text), пустая — без надписи, иначе заголовок."""
+    if c.get("overlay_text") is not None:
+        return c["overlay_text"]
+    return c.get("title") or ""
+
+
 def describe_trigger(trigger: str, score: float, signals: dict) -> str:
     if trigger == "viewer_clip":
         return "зрители сделали клип"
@@ -542,7 +549,7 @@ class App:
         log.info("🎞  #%d монтирую 9:16 (%s, %.0f с)…", c["id"], layout, end - start)
         t0 = time.time()
         await render_clip(self.ffmpeg, self.encoder, raw, out, start, end, info["width"], info["height"], cam,
-                          words_in(tr, start, end), c.get("title") or "",
+                          words_in(tr, start, end), video_caption(c),
                           f"twitch.tv/{c['channel']}", self.cfg.section("render"), top_media=top_media)
         log.info("✅ #%d клип готов за %.0f с (%.1f МБ) → на модерацию", c["id"], time.time() - t0,
                  out.stat().st_size / 1e6)

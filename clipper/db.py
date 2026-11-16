@@ -44,6 +44,7 @@ CREATE TABLE IF NOT EXISTS candidates (
     edit_start REAL, edit_end REAL,
     titles TEXT, title TEXT, description TEXT,
     category TEXT, tag TEXT, spoiler INTEGER DEFAULT 0, game TEXT,
+    overlay_text TEXT,                          -- надпись в начале видео: NULL = как заголовок, '' = без надписи
     render_path TEXT, render_duration REAL,
     parts TEXT,
     error TEXT,
@@ -83,6 +84,8 @@ class DB:
         cols = {r[1] for r in self.conn.execute("PRAGMA table_info(candidates)")}
         if "game" not in cols:
             self.conn.execute("ALTER TABLE candidates ADD COLUMN game TEXT")
+        if "overlay_text" not in cols:
+            self.conn.execute("ALTER TABLE candidates ADD COLUMN overlay_text TEXT")
         ch_cols = {r[1] for r in self.conn.execute("PRAGMA table_info(channels)")}
         if "cam_mode" not in ch_cols:
             self.conn.execute("ALTER TABLE channels ADD COLUMN cam_mode TEXT")

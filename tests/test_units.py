@@ -105,3 +105,12 @@ def test_filters_and_bitrate():
     assert "boxblur" in video_filter(1920, 1080, None)
     assert target_kbps(30, 45, 8000) == 8000
     assert target_kbps(90, 45, 8000) < 4000
+
+
+def test_video_caption_independent_from_title():
+    from clipper.app import video_caption
+    c = {"title": "Заголовок для Shorts", "overlay_text": None}
+    assert video_caption(c) == "Заголовок для Shorts"           # по умолчанию — как заголовок
+    assert video_caption({**c, "overlay_text": "ОН ЭТО СДЕЛАЛ"}) == "ОН ЭТО СДЕЛАЛ"
+    assert video_caption({**c, "overlay_text": ""}) == ""        # без надписи
+    assert ",Title," not in build_ass([], video_caption({**c, "overlay_text": ""}), "twitch.tv/x", True)

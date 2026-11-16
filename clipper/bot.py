@@ -46,6 +46,7 @@ MAIN_KB = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text=BTN_MOD), KeyboardB
 class Input(StatesGroup):
     add_channel = State()
     title = State()
+    overlay_text = State()
     hashtags = State()
     limit = State()
     overlay = State()
@@ -228,6 +229,7 @@ class BotUI:
         r.message.register(self.on_rejected, F.text == BTN_OUT)
         r.message.register(self.in_add_channel, Input.add_channel)
         r.message.register(self.in_title, Input.title)
+        r.message.register(self.in_overlay_text, Input.overlay_text)
         r.message.register(self.in_hashtags, Input.hashtags)
         r.message.register(self.in_limit, Input.limit)
         r.message.register(self.in_overlay, Input.overlay)
@@ -249,12 +251,15 @@ class BotUI:
         if c.get("game"):
             lines.append(f"🎮 {html.escape(c['game'])}")
         lines.append(f"«{html.escape(c.get('title') or '')}»")
+        if c.get("overlay_text") is not None:
+            lines.append(f"🔤 На видео: «{html.escape(c['overlay_text'])}»" if c["overlay_text"] else "🔤 Без надписи на видео")
         lines.append(f"⏱ {fmt_dur(c.get('render_duration'))} · В очереди ещё: {queue}")
         return "\n".join(lines)
 
     def _card_kb(self, cid: int) -> InlineKeyboardMarkup:
         return kb([[("✅ Одобрить", f"m:ok:{cid}"), ("❌ Отклонить", f"m:no:{cid}")],
-                   [("✂️ Обрезать", f"m:cut:{cid}"), ("📝 Заголовок", f"m:title:{cid}")]])
+                   [("✂️ Обрезать", f"m:cut:{cid}"), ("📝 Заголовок", f"m:title:{cid}")],
+                   [("🔤 Надпись на видео", f"m:ovr:{cid}")]])
 
     async def _send_card(self, c: dict) -> bool:
         """Отправляет карточку. False — клип отправить нельзя (он помечен failed), нужно брать следующий."""
@@ -383,6 +388,13 @@ class BotUI:
             self.db.update_candidate(cid, edit_start=c["clip_start"], edit_end=c["clip_end"])
             await self._safe(q.message.edit_reply_markup(reply_markup=self._cut_kb(self.db.candidate(cid))))
             return await q.answer()
+        if action == "ovr":
+            if c["kind"] != "clip":
+                return await q.answer("У подборки нет надписи в начале")
+            await self._safe(q.message.edit_reply_markup(reply_markup=kb(
+                [[("✏️ Своя надпись", f"o:{cid}:custom")], [("🚫 Без надписи", f"o:{cid}:none")],
+                 [("↩️ Как заголовок", f"o:{cid}:title"), ("← Назад", f"o:{cid}:back")]])))
+            return await q.answer()
         if action == "title":
             rows = [[(f"{i + 1}. {t[:40]}", f"t:{cid}:{i}")] for i, t in enumerate(c.get("titles") or [])]
             rows.append([("✏️ Свой вариант", f"t:{cid}:custom"), ("← Назад", f"t:{cid}:back")])
@@ -451,9 +463,54 @@ class BotUI:
                 return False
             self.db.update_candidate(cid, title=title, card_msg_id=None)
             self.db.kv_set("card_id", cid)
-            if c["kind"] == "clip":  # заголовок вшит в видео — перерендер
+            if c["kind"] == "clip" and c.get("overlay_text") is None:  # надпись = заголовок, она вшита в видео
                 self.db.update_candidate(cid, status="to_render", edit_start=c["clip_start"], edit_end=c["clip_end"])
             return True
+
+    async def _set_overlay(self, cid: int, text: str | None) -> bool:
+        """Надпись в начале видео (None — как заголовок, "" — без надписи) и перемонтаж."""
+        async with self._card_lock:
+            c = self.db.candidate(cid)
+            if not c or c["status"] != "rendered" or c["kind"] != "clip":
+                return False
+            self.db.update_candidate(cid, overlay_text=text, card_msg_id=None, status="to_render",
+                                     edit_start=c["clip_start"], edit_end=c["clip_end"])
+            self.db.kv_set("card_id", cid)
+            return True
+
+    async def cb_o(self, q, state, action, arg, parts):
+        cid = int(action)
+        c = self.db.candidate(cid)
+        if not c or c["status"] != "rendered":
+            return await q.answer("Клип уже обработан")
+        if arg == "back":
+            await self._safe(q.message.edit_reply_markup(reply_markup=self._card_kb(cid)))
+            return await q.answer()
+        if arg == "custom":
+            await state.set_state(Input.overlay_text)
+            await state.update_data(cid=cid)
+            await q.message.answer("Пришлите надпись для начала видео одним сообщением (до 60 символов). "
+                                   "Заголовок публикации останется прежним.")
+            return await q.answer()
+        await self._safe(q.message.delete())
+        await self._set_overlay(cid, "" if arg == "none" else None)
+        await q.answer("Перемонтирую без надписи" if arg == "none" else "Надпись = заголовок, перемонтирую")
+
+    async def in_overlay_text(self, m: Message, state: FSMContext):
+        data = await state.get_data()
+        await state.clear()
+        text = " ".join((m.text or "").split())[:60]
+        if not text:
+            return await m.answer("Пустая надпись — оставил как было. Чтобы убрать надпись, нажмите «🚫 Без надписи».")
+        cid = data.get("cid")
+        c = self.db.candidate(cid) if cid else None
+        if not c or c["status"] != "rendered":
+            return await m.answer("Этот клип уже обработан, надпись не изменена.", reply_markup=MAIN_KB)
+        if c.get("card_msg_id"):
+            await self._safe(self.bot.delete_message(self.owner_id, c["card_msg_id"]))
+        await self._set_overlay(cid, text)
+        await m.answer(f"Надпись на видео: «{html.escape(text)}». Перемонтирую, карточка придёт заново.",
+                       reply_markup=MAIN_KB)
 
     async def in_title(self, m: Message, state: FSMContext):
         data = await state.get_data()
