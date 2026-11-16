@@ -142,10 +142,10 @@ def test_cam_mode_and_overlay_resolution(app):
     assert app.channel_overlay("a")[1] == "своя"        # своя заставка канала важнее общей
 
 
-def test_provisional_cam_rect_before_confirmation(app):
+def test_cam_rect_only_after_confirmation(app):
     app.db.execute("INSERT INTO channels(login,display_name,state,added_at,cam_status) VALUES('b','b','active',0,'pending')")
     app.db.kv_set("cam:b", [0.79, 0.0, 0.21, 0.26])
-    app.db.kv_set("cam_method:b", "estimate")
-    assert app.cam_rect("b") is None            # примерную рамку по лицу без подтверждения не берём
     app.db.kv_set("cam_method:b", "edges")
-    assert app.cam_rect("b") == (0.79, 0.0, 0.21, 0.26)   # найденную по краям — берём сразу
+    assert app.cam_rect("b") is None            # до «✅ Верно» вебки в монтаже нет, даже найденной по краям
+    app.accept_cam("b", [0.79, 0.0, 0.21, 0.26])
+    assert app.cam_rect("b") == (0.79, 0.0, 0.21, 0.26)

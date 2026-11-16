@@ -685,15 +685,10 @@ class App:
             self.spawn(self.calibrate_cam(login))
 
     def cam_rect(self, login: str, ch: dict | None = None):
-        """Рамка вебки для монтажа. Пока вы не ответили в боте, используется уже найденная по краям или
-        по вырезке рамка — иначе клипы до подтверждения монтировались бы без вебки."""
+        """Рамка вебки для монтажа — только подтверждённая вами в боте (✅)."""
         ch = ch or self.db.channel(login) or {}
         if ch.get("cam_status") == "ok":
             return ch["cam_x"], ch["cam_y"], ch["cam_w"], ch["cam_h"]
-        if ch.get("cam_status") == "pending" and self.db.kv_get(f"cam_method:{login}") in ("edges", "template", "manual"):
-            rect = self.db.kv_get(f"cam:{login}")
-            if rect:
-                return tuple(rect)
         return None
 
     async def grab_frames(self, login: str, n: int = 3) -> list[Path]:
