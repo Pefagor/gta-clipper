@@ -149,3 +149,14 @@ def test_cam_rect_only_after_confirmation(app):
     assert app.cam_rect("b") is None            # до «✅ Верно» вебки в монтаже нет, даже найденной по краям
     app.accept_cam("b", [0.79, 0.0, 0.21, 0.26])
     assert app.cam_rect("b") == (0.79, 0.0, 0.21, 0.26)
+
+
+def test_auth_error_does_not_burn_candidates(app):
+    """401 от routerai: кандидат не тратит попытки и не уходит в ошибку, а ждёт исправления ключа."""
+    import asyncio
+    from clipper.llm import LLMAuthError
+    cid = app.db.add_candidate(channel="x", status="transcribed", attempts=0)
+    for _ in range(10):
+        asyncio.run(app._stage_failed(app.db.candidate(cid), "transcribed", LLMAuthError("401"), 6))
+    c = app.db.candidate(cid)
+    assert c["status"] == "transcribed" and c["attempts"] == 0 and c["next_try_at"] > 0

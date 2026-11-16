@@ -49,6 +49,10 @@ class LLMError(Exception):
     pass
 
 
+class LLMAuthError(LLMError):
+    """routerai не принял ключ (401/403): повторы не помогут, пока ключ не исправят."""
+
+
 def as_bool(v, default: bool) -> bool:
     if isinstance(v, bool):
         return v
@@ -131,6 +135,8 @@ class RouterAI:
                                      headers={"Authorization": f"Bearer {self.api_key}"})
         except httpx.HTTPError as e:
             raise LLMError(f"сеть: {e}") from e
+        if r.status_code in (401, 403):
+            raise LLMAuthError(f"routerai отклонил ключ (HTTP {r.status_code}): {r.text[:200]}")
         if r.status_code >= 400:
             raise LLMError(f"HTTP {r.status_code}: {r.text[:300]}")
         data = r.json()

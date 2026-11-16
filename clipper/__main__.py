@@ -111,13 +111,25 @@ async def cmd_doctor(cfg) -> int:
     if s.routerai_key:
         from .llm import RouterAI
         llm = RouterAI(cfg.section("llm"), s.routerai_key)
+        key = s.routerai_key
+        print(f"   ключ routerai: {key[:6]}…{key[-4:]} ({len(key)} симв.)")
         try:
             models = set(await llm.list_models())
-            for key in ("screen_model", "review_model"):
-                name = cfg.section("llm")[key]
-                line(name in models, f"модель {name} доступна в routerai")
+            for k in ("screen_model", "review_model"):
+                name = cfg.section("llm")[k]
+                line(name in models, f"модель {name} есть в каталоге routerai")
         except Exception as e:  # noqa: BLE001
-            line(False, f"routerai не ответил: {e}")
+            line(False, f"каталог моделей routerai не ответил: {e}")
+        # настоящий пробный запрос: список моделей может открываться и без ключа
+        for name in dict.fromkeys(cfg.section("llm")[k] for k in ("screen_model", "review_model")):
+            try:
+                r = await llm.http.post("/chat/completions", json={"model": name, "max_tokens": 5,
+                                        "messages": [{"role": "user", "content": "Ответь словом ok"}]},
+                                        headers={"Authorization": f"Bearer {key}"}, timeout=30)
+                ok = r.status_code == 200
+                line(ok, f"пробный запрос к {name}: " + ("работает" if ok else f"HTTP {r.status_code} {r.text[:200]}"))
+            except Exception as e:  # noqa: BLE001
+                line(False, f"пробный запрос к {name}: {e}")
     free = shutil.disk_usage(cfg.data_dir).free / 1e9
     line(free > 50, f"свободно на диске: {free:.0f} ГБ")
     return 0 if ok else 1

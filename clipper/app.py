@@ -16,7 +16,7 @@ from .config import Config
 from .cutter import CutError, cut_candidate, extract_audio, extract_frames, spread
 from .db import DB, day_start
 from .detector import ChannelDetector, OpenWindow, extend_window, plan_window
-from .llm import LLMError, RouterAI, build_context
+from .llm import LLMAuthError, LLMError, RouterAI, build_context
 from .recorder import Recorder
 from .render import render_clip, render_compilation
 from .segments import load_session_segments
@@ -373,6 +373,14 @@ class App:
                     await asyncio.sleep(5)
 
     async def _stage_failed(self, c: dict, status: str, e: Exception, max_attempts: int) -> None:
+        if isinstance(e, LLMAuthError):
+            # ключ не принят — кандидат не тратит попытки и ждёт, пока ключ исправят
+            self.db.update_candidate(c["id"], error=str(e)[:500], next_try_at=time.time() + 600)
+            await self.alert("llm_auth", "routerai не принимает ключ (401). Проверьте ROUTERAI_API_KEY в .env "
+                                         "(без кавычек и пробелов, ключ не отозван в кабинете), затем перезапустите "
+                                         "программу. Кандидаты ждут и обработаются после исправления.",
+                             every=3600)
+            return
         attempts = c["attempts"] + 1
         log.warning("кандидат #%d (%s): %s", c["id"], status, e)
         permanent = isinstance(e, CutError) and e.permanent
