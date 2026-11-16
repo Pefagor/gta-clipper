@@ -37,7 +37,7 @@ clips_poll_seconds: 30
 
 whisper:
   model: large-v3-turbo
-  device: auto             # auto | cuda | cpu
+  device: auto             # auto (видеокарта NVIDIA → Apple MPS → процессор) | cuda | mps | cpu
   compute_type: auto       # auto: float16 на видеокарте (с откатом на int8), int8 на процессоре
   language: ru
   beam_size: 5

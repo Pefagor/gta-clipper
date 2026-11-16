@@ -97,7 +97,10 @@ async def cmd_doctor(cfg) -> int:
     try:
         import ctranslate2
         n = ctranslate2.get_cuda_device_count()
-        print(f"   whisper: {'видеокарта NVIDIA (' + str(n) + ')' if n else 'процессор (видеокарта не найдена)'}")
+        from .transcribe import best_device
+        dev = best_device()
+        print("   whisper: " + {"cuda": f"видеокарта NVIDIA ({n})", "mps": "графическое ядро Apple (MPS)"}.get(
+            dev, "процессор (видеокарта не найдена)"))
     except Exception as e:  # noqa: BLE001
         line(False, f"faster-whisper: {e}")
     s = cfg.secrets

@@ -59,7 +59,10 @@ sent (пакет отправлен) → done`, либо `rejected / discarded /
 
 Обновление до новой версии: `git pull`, затем `pip install -e .` (в активированном окружении).
 
-На macOS: `brew install ffmpeg-full streamlink`, дальше так же (ffmpeg-full нужен ради субтитров).
+На macOS: `brew install ffmpeg-full python@3.12`, дальше так же (`source .venv/bin/activate`; ffmpeg-full
+нужен ради субтитров). На Apple Silicon Whisper сам работает на графическом ядре чипа (MPS) — примерно в 1.6
+раза быстрее процессора; при ошибке откатывается на процессор. Запуск без засыпания Мака:
+`caffeinate -dimsu python -m clipper run`.
 
 ## Как получить ключи
 

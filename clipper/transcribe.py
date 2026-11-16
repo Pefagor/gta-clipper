@@ -40,16 +40,16 @@ class Transcriber:
         device = self.cfg.get("device", "auto")
         compute = self.cfg.get("compute_type", "auto")
         if device == "auto":
-            try:
-                import ctranslate2
-                device = "cuda" if ctranslate2.get_cuda_device_count() > 0 else "cpu"
-            except Exception:  # noqa: BLE001
-                device = "cpu"
+            device = best_device()
         if compute != "auto":
             return [(device, compute)]
         if device == "cuda":
             # GTX 16xx иногда плохо работают с float16 — тогда откатываемся на int8
             return [("cuda", "float16"), ("cuda", "int8_float16"), ("cuda", "int8"), ("cpu", "int8")]
+        if device == "mps":
+            # Apple Silicon: графическое ядро чипа, ~1.6× быстрее процессора (замер на M4: 16 с против 27 с
+            # на 80 с речи). float32 — точнее float16 при почти той же скорости.
+            return [("mps", "float32"), ("cpu", "int8")]
         return [("cpu", "int8")]
 
     def transcribe(self, wav: Path) -> dict:
@@ -73,7 +73,8 @@ class Transcriber:
                                                    compute_type=compute)
                         self.device, self.compute_type = device, compute
                         log.info("🗣  Whisper %s загружен: %s (%s)", self.cfg.get("model"),
-                                 "видеокарта" if device == "cuda" else "процессор", compute)
+                                 {"cuda": "видеокарта NVIDIA", "mps": "графическое ядро Apple (MPS)"}.get(
+                                     device, "процессор"), compute)
                     result = self._run(wav)
                     if device == "cuda" and compute == "float16" and _looks_broken(result):
                         raise RuntimeError("cuda float16 дал пустой результат")
@@ -91,7 +92,10 @@ class Transcriber:
         # ломается на несовпадающих версиях PyAV.
         segments, info = self._model.transcribe(
             read_wav(wav), language=self.cfg.get("language", "ru"), word_timestamps=True,
-            vad_filter=True, beam_size=int(self.cfg.get("beam_size", 5)))
+            vad_filter=True, beam_size=int(self.cfg.get("beam_size", 5)),
+            # На MPS режим «с опорой на предыдущий текст» нестабилен и выбрасывает целые фразы
+            # (на тесте пропала ключевая реакция стримера) — там распознаём без него.
+            condition_on_previous_text=self.device != "mps")
         out = []
         for s in segments:
             words = [{"start": round(w.start, 2), "end": round(w.end, 2), "word": w.word.strip()}
@@ -111,10 +115,29 @@ def read_wav(path: Path):
     return np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
 
 
+def best_device() -> str:
+    """cuda — видеокарта NVIDIA; mps — Mac на Apple Silicon; иначе cpu."""
+    try:
+        import ctranslate2
+        if ctranslate2.get_cuda_device_count() > 0:
+            return "cuda"
+        import platform
+        import sys
+        if sys.platform == "darwin" and platform.machine() == "arm64":
+            try:
+                if ctranslate2.get_supported_compute_types("mps"):
+                    return "mps"
+            except Exception:  # noqa: BLE001 — старый ctranslate2 без MPS
+                pass
+    except Exception:  # noqa: BLE001
+        pass
+    return "cpu"
+
+
 def _device_error(e: Exception) -> bool:
     text = str(e).lower()
     return any(k in text for k in ("cuda", "cublas", "cudnn", "float16", "compute type", "gpu", "device",
-                                   "out of memory", "пустой результат"))
+                                   "out of memory", "пустой результат", "mps", "metal"))
 
 
 def _looks_broken(result: dict) -> bool:
