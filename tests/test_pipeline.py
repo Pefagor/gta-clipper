@@ -72,6 +72,18 @@ def test_candidate_goes_through_pipeline(app, tmp_path):
         await app._stage_failed(app.db.candidate(cid), "to_render", RuntimeError("boom"), 3)
         assert app.db.candidate(cid)["status"] == "rendered"
 
+        # отсеянный ИИ кандидат: причина видна, превью смотрится, можно вернуть в работу
+        app.db.update_candidate(cid, status="discarded", screen={"score": 3, "summary": "стример объясняет правила"})
+        c = app.db.candidate(cid)
+        assert [r["id"] for r in app.rejected_list()] == [cid]
+        assert "Haiku: 3/10" in app.reject_reason(c)
+        prev = await app.preview(c)
+        assert prev.exists() and prev.stat().st_size < 20_000_000
+        assert app.rescue(cid) == "в монтаж, потом придёт на модерацию"
+        c = app.db.candidate(cid)
+        assert c["status"] == "to_render" and c["title"] == "стример объясняет правила"
+        assert app.rescue(cid) is None  # уже в работе — повторно не возвращается
+
     asyncio.run(go())
 
 

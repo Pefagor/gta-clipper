@@ -20,7 +20,7 @@ from .llm import LLMError, RouterAI, build_context
 from .recorder import Recorder
 from .render import render_clip, render_compilation
 from .segments import load_session_segments
-from .tools import find_ffmpeg, find_ffprobe, pick_encoder, probe, run, streamlink_cmd
+from .tools import encoder_args, find_ffmpeg, find_ffprobe, pick_encoder, probe, run, streamlink_cmd
 from .transcribe import Transcriber, loud_events, read_wav, transcript_text, words_in
 from .twitch import TwitchAPI, parse_ts
 
@@ -698,6 +698,64 @@ class App:
             self.db.update_channel(login, cam_status="ok", cam_x=x, cam_y=y, cam_w=w, cam_h=h)
         else:
             self.db.update_channel(login, cam_status="none")
+
+    # ---------- отсеянные кандидаты ----------
+    def rejected_list(self, limit: int = 40) -> list[dict]:
+        """Кандидаты, которых отсеял ИИ или которые упали с ошибкой (пока их файлы не удалены уборкой)."""
+        return self.db.all("SELECT * FROM candidates WHERE kind='clip' AND status IN ('discarded','failed') "
+                           "AND dir IS NOT NULL ORDER BY id DESC LIMIT ?", (limit,))
+
+    @staticmethod
+    def reject_reason(c: dict) -> str:
+        screen, review = c.get("screen") or {}, c.get("review") or {}
+        if c["status"] == "failed":
+            return f"ошибка обработки: {(c.get('error') or 'неизвестно')[:300]}"
+        if isinstance(review, dict) and review and not review.get("keep", True):
+            return f"Sonnet решил, что для ролика не годится (оценка {review.get('score', '?')}/10)"
+        if isinstance(screen, dict) and "score" in screen:
+            return f"Haiku: {screen['score']}/10 — ниже порога. {screen.get('summary', '')}".strip()
+        return "отсеян"
+
+    async def preview(self, c: dict) -> Path:
+        """Лёгкая версия фрагмента (480p) для просмотра в Telegram: исходник 1080p бывает больше 50 МБ."""
+        d = Path(c["dir"])
+        out = d / "preview.mp4"
+        if out.exists():
+            return out
+        raw = d / "raw.mp4"
+        if not raw.exists():
+            raise CutError("фрагмент уже удалён уборкой", permanent=True)
+        code, log_out = await run([self.ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-i", str(raw),
+                                   "-vf", "scale=-2:480,fps=30", *encoder_args(self.encoder, 1200),
+                                   "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "96k", "-movflags", "+faststart",
+                                   str(out)], timeout=300)
+        if code != 0 or not out.exists():
+            raise RuntimeError(f"превью не получилось: {log_out[-300:]}")
+        return out
+
+    def rescue(self, cid: int) -> str | None:
+        """Вернуть отсеянного кандидата в работу. Возвращает описание, куда он пошёл, или None."""
+        c = self.db.candidate(cid)
+        if not c or c["status"] not in ("discarded", "failed") or not c.get("dir"):
+            return None
+        d = Path(c["dir"])
+        if not (d / "raw.mp4").exists():
+            self.db.update_candidate(cid, status="to_cut", attempts=0, error=None, next_try_at=0)
+            return "заново на вырезку"
+        if not (d / "transcript.json").exists():
+            self.db.update_candidate(cid, status="cut", attempts=0, error=None, next_try_at=0)
+            return "на распознавание речи"
+        screen, review = c.get("screen") or {}, c.get("review") or {}
+        if isinstance(review, dict) and review.get("titles"):  # Sonnet уже выбрал границы — берём их
+            start, end, titles = review["start"], review["end"], review["titles"]
+        else:
+            summary = (screen.get("summary") if isinstance(screen, dict) else "") or "Момент со стрима"
+            start, end, titles = 0.0, c["raw_duration"], [summary[:60]]
+        self.db.update_candidate(cid, status="to_render", clip_start=start, clip_end=end, titles=titles,
+                                 title=titles[0], category=c.get("category") or "другое", attempts=0,
+                                 error=None, next_try_at=0, edit_start=None, edit_end=None)
+        log.info("♻️  #%d возвращён из отсеянных — в монтаж и на модерацию", cid)
+        return "в монтаж, потом придёт на модерацию"
 
     # ---------- режим вебки и заставки ----------
     def cam_mode(self, login: str) -> str:

@@ -23,6 +23,8 @@ from .db import day_start
 log = logging.getLogger(__name__)
 
 BTN_MOD, BTN_PUB, BTN_CH, BTN_ST, BTN_SET = "🎬 Модерация", "📤 Публикация", "📺 Каналы", "📊 Статус", "⚙️ Настройки"
+BTN_OUT = "🗂 Отсеянные"
+PAGE = 8
 CAM_MODES = {"auto": "авто", "off": "выкл", "media": "заставка"}
 CAT_ICON = {"смешное": "😂", "рейдж": "🤬", "баг": "🐞", "погоня": "🚓", "реакция": "😱", "эпичное": "🔥", "подборка": "🎞",
             "другое": "🎬"}
@@ -36,7 +38,7 @@ def kb(rows) -> InlineKeyboardMarkup:
 
 MAIN_KB = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text=BTN_MOD), KeyboardButton(text=BTN_PUB)],
                                         [KeyboardButton(text=BTN_CH), KeyboardButton(text=BTN_ST)],
-                                        [KeyboardButton(text=BTN_SET)]],
+                                        [KeyboardButton(text=BTN_OUT), KeyboardButton(text=BTN_SET)]],
                               resize_keyboard=True, is_persistent=True)
 
 
@@ -102,6 +104,11 @@ def adjust_rect(rect: list[float], op: str, move: float = 0.01, grow: float = 0.
     w, h = min(max(w, 0.03), 1.0), min(max(h, 0.03), 1.0)
     x, y = min(max(x, 0.0), 1.0 - w), min(max(y, 0.0), 1.0 - h)
     return [round(x, 4), round(y, 4), round(w, 4), round(h, 4)]
+
+
+def describe_reason_trigger(c: dict) -> str:
+    trig = {"rage": "крик стримера", "viewer_clip": "клип зрителей", "detector": "всплеск чата/звука"}
+    return f"нашёл: {trig.get(c.get('trigger') or '', 'детектор')}, балл {c.get('score') or 0:.0f}"
 
 
 def rating(c: dict) -> str:
@@ -188,6 +195,7 @@ class BotUI:
         r.message.register(self.on_channels, F.text == BTN_CH)
         r.message.register(self.on_status, F.text == BTN_ST)
         r.message.register(self.on_settings, F.text == BTN_SET)
+        r.message.register(self.on_rejected, F.text == BTN_OUT)
         r.message.register(self.in_add_channel, Input.add_channel)
         r.message.register(self.in_title, Input.title)
         r.message.register(self.in_hashtags, Input.hashtags)
@@ -797,6 +805,85 @@ class BotUI:
                 media=InputMediaPhoto(media=FSInputFile(photo), caption=caption),
                 reply_markup=self._cam_adjust_kb(login)))
         await self._safe(q.answer())
+
+    # ================= отсеянные =================
+    def _rejected_view(self, page: int) -> tuple[str, InlineKeyboardMarkup]:
+        rows_db = self.app.rejected_list(limit=200)
+        if not rows_db:
+            return ("🗂 <b>Отсеянных нет.</b>\nЗдесь появятся кандидаты, которых отбраковал ИИ или которые упали "
+                    "с ошибкой. Хранятся сутки."), kb([])
+        pages = (len(rows_db) + PAGE - 1) // PAGE
+        page = min(max(page, 0), pages - 1)
+        rows = []
+        for c in rows_db[page * PAGE:(page + 1) * PAGE]:
+            screen = c.get("screen") if isinstance(c.get("screen"), dict) else {}
+            if c["status"] == "failed":
+                mark = "❗ ошибка"
+            elif isinstance(c.get("review"), dict) and c["review"]:
+                mark = "Sonnet ✗"
+            else:
+                mark = f"Haiku {screen.get('score', '?')}/10"
+            when = time.strftime("%H:%M", time.localtime(c.get("peak_ts") or c.get("created_at") or 0))
+            rows.append([(f"#{c['id']} {c['channel']} · {mark} · {when}"[:60], f"x:open:{c['id']}:{page}")])
+        nav = []
+        if page > 0:
+            nav.append(("⬅️", f"x:list:{page - 1}"))
+        if page < pages - 1:
+            nav.append(("➡️", f"x:list:{page + 1}"))
+        if nav:
+            rows.append(nav)
+        return (f"🗂 <b>Отсеянные</b> ({len(rows_db)}), стр. {page + 1}/{pages}\n"
+                "Откройте кандидата, чтобы увидеть причину, посмотреть фрагмент или вернуть его в работу."), kb(rows)
+
+    async def on_rejected(self, m: Message, state: FSMContext):
+        await state.clear()
+        text, markup = self._rejected_view(0)
+        await m.answer(text, reply_markup=markup)
+
+    def _rejected_card(self, c: dict, page: int) -> tuple[str, InlineKeyboardMarkup]:
+        screen = c.get("screen") if isinstance(c.get("screen"), dict) else {}
+        lines = [f"🗂 <b>#{c['id']}</b> · 📺 {html.escape(c['channel'])}"
+                 + (f" · 🎮 {html.escape(c['game'])}" if c.get("game") else ""),
+                 f"🕐 {ago(c.get('peak_ts') or c.get('created_at'))} · {describe_reason_trigger(c)}",
+                 f"<b>Причина:</b> {html.escape(self.app.reject_reason(c))}"]
+        if screen.get("category"):
+            lines.append(f"Категория по мнению ИИ: {CAT_ICON.get(screen['category'], '🎬')} {html.escape(screen['category'])}")
+        cid = c["id"]
+        return "\n".join(lines), kb([[("▶️ Посмотреть фрагмент", f"x:view:{cid}:{page}")],
+                                     [("♻️ Всё-таки сделать клип", f"x:save:{cid}:{page}")],
+                                     [("← К списку", f"x:list:{page}")]])
+
+    async def cb_x(self, q, state, action, arg, parts):
+        if action == "list":
+            text, markup = self._rejected_view(int(arg or 0))
+            await self._safe(q.message.edit_text(text, reply_markup=markup))
+            return await q.answer()
+        cid, page = int(arg), int(parts[3]) if len(parts) > 3 else 0
+        c = self.db.candidate(cid)
+        if not c:
+            return await q.answer("Кандидат не найден", show_alert=True)
+        if action == "open":
+            text, markup = self._rejected_card(c, page)
+            await self._safe(q.message.edit_text(text, reply_markup=markup))
+            return await q.answer()
+        if action == "view":
+            await q.answer("Готовлю видео, несколько секунд…")
+            try:
+                path = await self.app.preview(c)
+                await self.bot.send_video(self.owner_id, FSInputFile(path), supports_streaming=True,
+                                          caption=f"#{cid} · {html.escape(c['channel'])} · фрагмент целиком "
+                                                  f"({fmt_dur(c.get('raw_duration'))})")
+            except Exception as e:  # noqa: BLE001
+                await q.message.answer(f"Не получилось показать фрагмент: {html.escape(str(e)[:200])}")
+            return
+        if action == "save":
+            where = self.app.rescue(cid)
+            if not where:
+                return await q.answer("Уже нельзя: кандидат обработан или его файлы удалены", show_alert=True)
+            await self._safe(q.message.edit_text(f"♻️ #{cid} возвращён в работу — {where}.",
+                                                 reply_markup=kb([[("← К списку", f"x:list:{page}")]])))
+            return await q.answer("Вернул в работу")
+        await q.answer()
 
     # ================= статус =================
     def _status_text(self) -> str:
