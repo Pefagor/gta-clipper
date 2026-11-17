@@ -15,6 +15,7 @@ from .chat import ChatHub
 from .config import Config
 from .cutter import CutError, cut_candidate, extract_audio, extract_frames, spread
 from .db import DB, day_start
+from .errors import explain
 from .detector import ChannelDetector, OpenWindow, extend_window, plan_window
 from .llm import LLMAuthError, LLMError, RouterAI, build_context
 from .recorder import Recorder
@@ -27,6 +28,9 @@ from .twitch import TwitchAPI, parse_ts
 log = logging.getLogger(__name__)
 
 FINAL = ("rejected", "discarded", "failed", "done")
+STAGE_RU = {"to_cut": "вырезка", "cut": "распознавание речи", "transcribed": "оценка Haiku",
+            "screened": "Sonnet", "to_render": "монтаж"}
+
 
 
 def video_caption(c: dict) -> str:
@@ -168,7 +172,7 @@ class App:
                  self._stage("to_cut", self._do_cut), self._stage("cut", self._do_transcribe),
                  self._stage("transcribed", self._do_screen, max_attempts=6),
                  self._stage("screened", self._do_review, max_attempts=6),
-                 self._stage("to_render", self._do_render), self.videos.loop()]
+                 self._stage("to_render", self._do_render), self.videos.loop(), self._summary_loop()]
         if self.twitch.enabled:
             loops.append(self._clips_loop())
         self._tasks = [asyncio.create_task(c) for c in loops]
@@ -391,28 +395,35 @@ class App:
                              every=3600)
             return
         attempts = c["attempts"] + 1
-        log.warning("кандидат #%d (%s): %s", c["id"], status, e)
+        why = explain(e)
+        log.debug("кандидат #%d (%s): %r", c["id"], status, e)  # полный текст — в файл лога
         permanent = isinstance(e, CutError) and e.permanent
+        stage = STAGE_RU.get(status, status)
+        if attempts < max_attempts and not permanent:
+            log.warning("#%d [%s] %s не удалось (попытка %d из %d): %s", c["id"], c.get("channel") or "?", stage,
+                        attempts, max_attempts, why)
+        else:
+            log.error("#%d [%s] %s не удалось, клип пропущен: %s", c["id"], c.get("channel") or "?", stage, why)
         if attempts >= max_attempts or permanent:
             old = c.get("render_path")
             if status == "to_render" and old and Path(old).exists():
                 # неудачный перерендер: возвращаем прежний готовый клип на модерацию
                 self.db.update_candidate(c["id"], status="rendered", edit_start=None, edit_end=None,
                                          card_msg_id=None, attempts=0, error=str(e)[:500])
-                await self.alert(f"rerender:{c['id']}", f"Перерендер клипа #{c['id']} не удался, "
-                                                        f"оставил прежнюю версию: {str(e)[:200]}")
+                await self.alert(f"rerender:{c['id']}", f"Перемонтаж клипа #{c['id']} не удался, "
+                                                        f"оставил прежнюю версию: {why}")
                 return
             self.db.update_candidate(c["id"], status="failed", error=str(e)[:500], attempts=attempts)
             if c["kind"] == "compilation":
                 self.release_parts(c)
             if not permanent:
                 await self.alert(f"fail:{status}",
-                                 f"Кандидат #{c['id']} не обработан ({status}): {str(e)[:200]}")
+                                 f"Клип #{c['id']} ({c.get('channel') or '?'}) пропущен — {stage} не удалось: {why}")
         else:
             self.db.update_candidate(c["id"], attempts=attempts, error=str(e)[:500],
                                      next_try_at=time.time() + 30 * 2 ** (attempts - 1))
             if isinstance(e, LLMError) and attempts >= 3:
-                await self.alert("llm", f"routerai не отвечает: {str(e)[:150]}",
+                await self.alert("llm", f"Нейросеть недоступна: {why}. Кандидаты ждут и повторятся сами.",
                                  [[("🔁 Повторить сейчас", "st:retry"), ("📊 Статус", "st:show")]])
 
     def cand_dir(self, c: dict) -> Path:
@@ -425,7 +436,7 @@ class App:
                                                   c["win_start"], c["win_end"], c["peak_ts"])
         if dur < 8:
             raise CutError(f"слишком короткий кусок записи ({dur:.0f} с)", permanent=True)
-        log.info("✂️  #%d вырезан фрагмент %d с", c["id"], dur)
+        log.info("✂️  #%d [%s] вырезан фрагмент %d с", c["id"], c.get("channel") or "?", dur)
         self.db.update_candidate(c["id"], status="cut", dir=str(out_dir), raw_start_ts=raw_start,
                                  raw_duration=dur, attempts=0, error=None)
 
@@ -433,7 +444,7 @@ class App:
         d = Path(c["dir"])
         wav = d / "audio.wav"
         await extract_audio(self.ffmpeg, d / "raw.mp4", wav)
-        log.info("🗣  #%d распознаю речь…", c["id"])
+        log.info("🗣  #%d [%s] распознаю речь…", c["id"], c.get("channel") or "?")
         t0 = time.time()
         tr = await asyncio.to_thread(self.transcriber.transcribe, wav)
         try:  # крики — по самому звуку: Whisper громкость не передаёт
@@ -444,7 +455,7 @@ class App:
         wav.unlink(missing_ok=True)
         words = sum(len(s.get("words", [])) for s in tr.get("segments", []))
         loud = len(tr.get("loud", []))
-        log.info("🗣  #%d речь распознана за %.0f с: %d слов%s", c["id"], time.time() - t0, words,
+        log.info("🗣  #%d [%s] речь распознана за %.0f с: %d слов%s", c["id"], c.get("channel") or "?", time.time() - t0, words,
                  f", криков: {loud}" if loud else "")
         self.db.update_candidate(c["id"], status="transcribed", attempts=0, error=None)
 
@@ -487,7 +498,7 @@ class App:
 
     async def _do_screen(self, c: dict) -> None:
         if not self.llm.enabled:  # без ключа routerai: пропускаем ИИ, на модерацию идёт всё окно
-            log.info("🤖 #%d ИИ-отбор выключен (нет ключа routerai) — беру фрагмент целиком", c["id"])
+            log.info("🤖 #%d [%s] ИИ-отбор выключен (нет ключа routerai) — беру фрагмент целиком", c["id"], c.get("channel") or "?")
             self.db.update_candidate(c["id"], status="to_render", screen={"skipped": True}, clip_start=0.0,
                                      clip_end=c["raw_duration"], titles=[f"{self.streamer_name(c['channel'])} на стриме"],
                                      title=f"{self.streamer_name(c['channel'])} на стриме",
@@ -498,12 +509,12 @@ class App:
         d = Path(c["dir"])
         peak_rel = c["peak_ts"] - c["raw_start_ts"]
         frames = await extract_frames(self.ffmpeg, d / "raw.mp4", d, spread(c["raw_duration"], 3, peak_rel, 30), "s")
-        log.info("🤖 #%d Haiku оценивает момент…", c["id"])
+        log.info("🤖 #%d [%s] Haiku оценивает момент…", c["id"], c.get("channel") or "?")
         res = await self.llm.screen(await self._context(c), frames)
         thr = int(self.cfg.section("llm").get("screen_threshold", 6))
         status = "screened" if res["score"] >= thr else "discarded"
         verdict = "дальше в Sonnet" if status == "screened" else f"отсеян (порог {thr})"
-        log.info("🤖 #%d Haiku: %d/10, %s — %s · %s", c["id"], res["score"], res["category"],
+        log.info("🤖 #%d [%s] Haiku: %d/10, %s — %s · %s", c["id"], c.get("channel") or "?", res["score"], res["category"],
                  res.get("summary", "")[:80], verdict)
         self.db.update_candidate(c["id"], status=status, screen=res, category=res["category"], attempts=0, error=None)
 
@@ -512,13 +523,13 @@ class App:
             return
         d = Path(c["dir"])
         frames = await extract_frames(self.ffmpeg, d / "raw.mp4", d, spread(c["raw_duration"], 6), "r")
-        log.info("🎬 #%d Sonnet выбирает границы и заголовки…", c["id"])
+        log.info("🎬 #%d [%s] Sonnet выбирает границы и заголовки…", c["id"], c.get("channel") or "?")
         res = await self.llm.review(await self._context(c, c.get("screen")), frames, c["raw_duration"])
         if not res["keep"]:
-            log.info("🎬 #%d Sonnet: не годится для ролика — отсеян", c["id"])
+            log.info("🎬 #%d [%s] Sonnet: не годится для ролика — отсеян", c["id"], c.get("channel") or "?")
             self.db.update_candidate(c["id"], status="discarded", review=res)
             return
-        log.info("🎬 #%d Sonnet: %d/10, %s, %.0f–%.0f с (%.0f с)%s, «%s»", c["id"], res["score"], res["category"],
+        log.info("🎬 #%d [%s] Sonnet: %d/10, %s, %.0f–%.0f с (%.0f с)%s, «%s»", c["id"], c.get("channel") or "?", res["score"], res["category"],
                  res["start"], res["end"], res["end"] - res["start"], ", СПОЙЛЕР" if res["spoiler"] else "",
                  res["titles"][0])
         self.db.update_candidate(c["id"], status="to_render", review=res, clip_start=res["start"],
@@ -547,18 +558,18 @@ class App:
                 log.warning("#%d режим «заставка», но файла заставки нет — монтирую без вебки", c["id"])
         if cam and not await self._cam_present(raw, d, cam, start, end):
             # стример поменял раскладку (полноэкранная вебка, сцена «отошёл») — макет без вебки
-            log.info("🎥 #%d в рамке вебки нет лица — монтирую без вебки", c["id"])
+            log.info("🎥 #%d [%s] в рамке вебки нет лица — монтирую без вебки", c["id"], c.get("channel") or "?")
             cam = None
         tr = json.loads((d / "transcript.json").read_text(encoding="utf-8"))
         out = d / "clip.mp4"
         layout = "заставка сверху" if top_media else "вебка сверху" if cam else "без вебки"
-        log.info("🎞  #%d монтирую 9:16 (%s, %.0f с)…", c["id"], layout, end - start)
+        log.info("🎞  #%d [%s] монтирую 9:16 (%s, %.0f с)…", c["id"], c.get("channel") or "?", layout, end - start)
         t0 = time.time()
         await render_clip(self.ffmpeg, self.encoder, raw, out, start, end, info["width"], info["height"], cam,
                           words_in(tr, start, end), video_caption(c),
                           c.get("credit") or f"twitch.tv/{c['channel']}", self.cfg.section("render"),
                           top_media=top_media, badge=f"ЧАСТЬ {c['part']}" if c.get("part") else "")
-        log.info("✅ #%d клип готов за %.0f с (%.1f МБ) → на модерацию", c["id"], time.time() - t0,
+        log.info("✅ #%d [%s] клип готов за %.0f с (%.1f МБ) → на модерацию", c["id"], c.get("channel") or "?", time.time() - t0,
                  out.stat().st_size / 1e6)
         self.db.update_candidate(c["id"], status="rendered", render_path=str(out), render_duration=end - start,
                                  clip_start=start, clip_end=end, edit_start=None, edit_end=None,
@@ -862,6 +873,21 @@ class App:
             return own, "своя"
         common = self.overlay_path("_default")
         return (common, "общая") if common else (None, "нет файла")
+
+    async def _summary_loop(self) -> None:
+        """Раз в 15 минут — короткий итог в консоль, чтобы было видно, что программа жива и что успела."""
+        while True:
+            await asyncio.sleep(900)
+            try:
+                st = self.status()
+                hour = self.db.scalar("SELECT COUNT(*) FROM candidates WHERE created_at>=?", (time.time() - 3600,)) or 0
+                videos = self.db.scalar("SELECT COUNT(*) FROM videos WHERE status NOT IN ('done','failed')") or 0
+                log.info("📊 итог: запись %d из %d каналов · моментов за час %d · в обработке %d · на модерации %d · "
+                         "ждут публикации %d%s · ИИ сегодня %.0f ₽ · диск %.0f ГБ", st["recording"], st["channels"], hour,
+                         st["processing"], st["moderation"], st["publish"],
+                         f" · видео в работе {videos}" if videos else "", st["spend_today"], st["free_gb"])
+            except Exception:  # noqa: BLE001
+                log.debug("итог", exc_info=True)
 
     # ---------- уборка ----------
     async def _janitor_loop(self) -> None:

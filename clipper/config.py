@@ -46,6 +46,30 @@ class Config(dict):
         return self.get(name) or {}
 
 
+class ConfigError(Exception):
+    pass
+
+
+def _read_yaml(path: Path) -> dict:
+    """YAML с понятной ошибкой: файл, строка и что не так."""
+    try:
+        return yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except yaml.YAMLError as e:
+        mark = getattr(e, "problem_mark", None)
+        where = f", строка {mark.line + 1}" if mark else ""
+        problem = str(getattr(e, "problem", "") or e).split("\n")[0]
+        low = problem.lower()
+        if "\t" in problem or "'\\t'" in problem:
+            problem = "табуляция вместо пробелов (в YAML отступы — только пробелами)"
+        elif "mapping values are not allowed" in low or "could not find expected ':'" in low:
+            problem = "пропущено или лишнее двоеточие — проверьте эту и предыдущую строку (нужно «название: значение»)"
+        elif "found unexpected end of stream" in low or "while scanning a quoted scalar" in low:
+            problem = "не закрыты кавычки"
+        elif "expected <block end>" in low or "did not find expected key" in low:
+            problem = "сбились отступы — строки одного уровня должны начинаться с одинакового числа пробелов"
+        raise ConfigError(f"{path.name}{where}: {problem}") from None
+
+
 def clean_key(value: str) -> str:
     """Ключ без кавычек, пробелов, переносов и невидимых символов (часто прилипают при копировании)."""
     value = value.strip().strip('"').strip("'").strip()
@@ -54,10 +78,10 @@ def clean_key(value: str) -> str:
 
 def load_config(path: Path | None = None, env_path: Path | None = None) -> Config:
     path = path or ROOT / "config.yaml"
-    raw = yaml.safe_load(path.read_text(encoding="utf-8")) if path.exists() else {}
+    raw = _read_yaml(path) if path.exists() else {}
     local = ROOT / "config.local.yaml"  # необязательные личные переопределения
     if path == ROOT / "config.yaml" and local.exists():
-        raw = _merge(raw, yaml.safe_load(local.read_text(encoding="utf-8")) or {})
+        raw = _merge(raw, _read_yaml(local) or {})
     cfg = Config(raw)
     cfg.root = ROOT
     data_dir = Path(cfg.get("data_dir", "data"))

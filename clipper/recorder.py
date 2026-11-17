@@ -124,7 +124,7 @@ class Recorder:
                         log.info("📼 [%s] запись идёт, сегменты пишутся", self.login)
                     self.healthy = True
                 if streamlink.returncode is not None or ffmpeg.returncode is not None:
-                    reason = "стрим закончился или пропало соединение"
+                    reason = streamlink_reason(part_dir / "streamlink.log") or "стрим закончился или пропало соединение"
                     break
                 ref = indexer.last_new_at if indexer.seen else started
                 if time.time() - ref > stall + (30 if not indexer.seen else 0):
@@ -168,6 +168,17 @@ class Recorder:
                 p.kill()
                 await p.wait()
         self._procs = []
+
+
+def streamlink_reason(log_path: Path) -> str:
+    """Причина обрыва из последних строк лога streamlink — понятным языком."""
+    from .errors import explain
+    try:
+        lines = [l for l in log_path.read_text(encoding="utf-8", errors="replace").splitlines() if l.strip()]
+    except OSError:
+        return ""
+    errs = [l for l in lines[-15:] if "error" in l.lower() or "unable" in l.lower() or "no playable" in l.lower()]
+    return explain(errs[-1]) if errs else ""
 
 
 def loudness_db(chunk: bytes) -> float:

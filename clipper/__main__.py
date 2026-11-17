@@ -11,19 +11,49 @@ from logging.handlers import RotatingFileHandler
 from .config import load_config
 
 
+COLORS = {logging.WARNING: "\033[33m", logging.ERROR: "\033[31m", logging.CRITICAL: "\033[31m"}
+DIM, RESET = "\033[2m", "\033[0m"
+
+
+def _enable_colors() -> bool:
+    """Цвета в консоли: на Windows их нужно включить (режим VT), при выводе в файл — не нужны."""
+    if not sys.stdout.isatty():
+        return False
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            k = ctypes.windll.kernel32
+            h = k.GetStdHandle(-11)
+            mode = ctypes.c_uint32()
+            if not k.GetConsoleMode(h, ctypes.byref(mode)) or not k.SetConsoleMode(h, mode.value | 0x0004):
+                return False
+        except Exception:  # noqa: BLE001
+            return False
+    return True
+
+
 class ConsoleFormatter(logging.Formatter):
-    """Консоль: «12:03:41 сообщение», предупреждения и ошибки помечены."""
+    """Консоль: «12:03:41 сообщение». Предупреждения — жёлтым с ⚠️, ошибки — красным с ❗ и объяснением,
+    без трассировок (они в data/logs/app.log)."""
+
+    def __init__(self, colors: bool):
+        super().__init__()
+        self.colors = colors
 
     def format(self, record: logging.LogRecord) -> str:
+        from .errors import explain
         msg = record.getMessage()
+        if record.exc_info and record.exc_info[1] is not None and record.levelno >= logging.ERROR:
+            msg = f"{msg}: {explain(record.exc_info[1])} (подробности — data/logs/app.log)"
         if record.levelno >= logging.ERROR:
-            msg = f"❗ ОШИБКА: {msg}"
+            msg = f"❗ {msg}"
         elif record.levelno >= logging.WARNING:
             msg = f"⚠️  {msg}"
-        line = f"{self.formatTime(record, '%H:%M:%S')} {msg}"
-        if record.exc_info and record.levelno >= logging.ERROR:
-            line += "\n" + self.formatException(record.exc_info)
-        return line
+        ts = self.formatTime(record, "%H:%M:%S")
+        if not self.colors:
+            return f"{ts} {msg}"
+        color = COLORS.get(record.levelno, "")
+        return f"{DIM}{ts}{RESET} {color}{msg}{RESET if color else ''}"
 
 
 def setup_logging(cfg) -> None:
@@ -35,15 +65,44 @@ def setup_logging(cfg) -> None:
         except (AttributeError, ValueError):
             pass
     root = logging.getLogger()
-    root.setLevel(logging.INFO)
+    root.setLevel(logging.DEBUG)
     console = logging.StreamHandler(sys.stdout)
-    console.setFormatter(ConsoleFormatter())
+    console.setLevel(logging.INFO)
+    console.setFormatter(ConsoleFormatter(_enable_colors()))
     file = RotatingFileHandler(cfg.data_dir / "logs" / "app.log", maxBytes=5_000_000, backupCount=5, encoding="utf-8")
-    file.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s", "%H:%M:%S"))
+    file.setLevel(logging.DEBUG)  # в файле — всё, включая трассировки и полные тексты ошибок
+    file.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s", "%Y-%m-%d %H:%M:%S"))
     root.addHandler(console)
     root.addHandler(file)
-    for noisy in ("httpx", "httpx2", "httpcore", "aiogram.event", "aiogram.dispatcher", "faster_whisper"):
+    for noisy in ("httpx", "httpx2", "httpcore", "aiogram", "aiohttp", "asyncio", "faster_whisper", "urllib3",
+                  "streamlink", "PIL", "huggingface_hub", "filelock"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
+
+
+def _banner(app, cfg) -> None:
+    """Сводка при запуске: что включено, что нет и почему."""
+    from .version import full_version
+    s, st = cfg.secrets, app.status()
+    llm = cfg.section("llm")
+    chans = app.db.channels()
+    on, off = "✅", "➖"
+    rows = [
+        f"🏷  gta-clipper {full_version()}",
+        f"{on} ffmpeg · кодировщик видео: {app.encoder}",
+        f"{on if s.telegram_token else off} Telegram-бот" + ("" if s.telegram_token else " выключен — нет TELEGRAM_BOT_TOKEN, клипы копятся в data/candidates"),
+        f"{on if s.routerai_key else off} ИИ-отбор" + (f": {llm.get('screen_model')} → {llm.get('review_model')}"
+                                                   if s.routerai_key else " выключен — нет ROUTERAI_API_KEY, на модерацию идёт весь фрагмент"),
+        f"{on if s.has_twitch else off} Twitch API" + ("" if s.has_twitch else " не настроен — без клипов зрителей и проверки ников"),
+        f"📺 каналы ({len(chans)}): " + (", ".join(c["login"] + (" ⏸" if c["state"] == "paused" else "") for c in chans) or "нет — добавьте в боте"),
+        f"💾 свободно на диске: {st['free_gb']:.0f} ГБ · данные: {cfg.data_dir}",
+    ]
+    if st["moderation"] or st["processing"]:
+        rows.append(f"📦 с прошлого запуска: на модерации {st['moderation']}, в обработке {st['processing']}")
+    width = max(len(r) for r in rows) + 2
+    logging.info("─" * min(width, 100))
+    for r in rows:
+        logging.info(r)
+    logging.info("─" * min(width, 100))
 
 
 async def cmd_run(cfg, extra_channels: list[str]) -> None:
@@ -58,22 +117,22 @@ async def cmd_run(cfg, extra_channels: list[str]) -> None:
         app.bot = BotUI(app, cfg.secrets.telegram_token, cfg.secrets.telegram_owner_id)
         if not cfg.secrets.telegram_owner_id:
             logging.warning("TELEGRAM_OWNER_ID не задан: напишите боту /start, он пришлёт ваш ID")
-    else:
-        logging.warning("TELEGRAM_BOT_TOKEN не задан: бот выключен, клипы будут копиться в data/candidates")
     await app.start()
-    from .version import full_version
-    logging.info("🏷  gta-clipper %s", full_version())
-    logging.info("▶️  программа запущена. Каналы: %s", ", ".join(c["login"] for c in app.db.channels()) or "нет")
+    _banner(app, cfg)
+    logging.info("▶️  программа запущена. Остановить — Ctrl+C")
     try:
         if app.bot:
             await app.bot.run()
         else:
             await asyncio.Event().wait()
     finally:
+        logging.info("⏹  останавливаюсь — дописываю записи…")
         await app.shutdown()
+        logging.info("⏹  программа остановлена")
 
 
 async def cmd_doctor(cfg) -> int:
+
     from .tools import find_ffmpeg, find_ffprobe, pick_encoder, _has_libass
 
     ok = True
@@ -194,17 +253,27 @@ def main() -> None:
     sub.add_parser("queue", help="что сейчас в обработке и почему")
     args = p.parse_args()
 
-    cfg = load_config()
+    try:
+        cfg = load_config()
+    except Exception as e:  # noqa: BLE001
+        print(f"❗ Ошибка в настройках — {e}")
+        print("   Исправьте файл и запустите снова. В YAML важны отступы (пробелами) и двоеточие после названия.")
+        sys.exit(2)
     if args.cmd == "doctor":
         sys.exit(asyncio.run(cmd_doctor(cfg)))
     if args.cmd == "queue":
         return cmd_queue(cfg)
     setup_logging(cfg)
     if args.cmd == "run":
+        from .errors import explain
         try:
             asyncio.run(cmd_run(cfg, args.channel))
         except KeyboardInterrupt:
             pass
+        except Exception as e:  # noqa: BLE001 — понятная причина вместо трассировки
+            logging.debug("программа остановилась", exc_info=True)
+            logging.error("Программа остановилась: %s. Подробности — %s", explain(e), cfg.data_dir / "logs" / "app.log")
+            sys.exit(1)
         return
     from .db import DB
     db = DB(cfg.data_dir / "app.db")

@@ -9,6 +9,7 @@ import time
 from pathlib import Path
 
 from .cutter import extract_audio
+from .errors import explain
 from .llm import LLMError
 from .tools import encoder_args, probe, run
 from .transcribe import loud_events, read_wav
@@ -61,9 +62,11 @@ class VideoJobs:
                     await self.app.bot.notify(f"🔗 Видео #{job['id']} обработано ({MODES.get(job['mode'])}): "
                                               f"{n} клип. — придут на модерацию.")
             except Exception as e:  # noqa: BLE001
-                log.exception("видео #%d", job["id"])
-                self.update(job["id"], status="failed", progress="ошибка", error=str(e)[:500])
-                await self.app.alert(f"video:{job['id']}", f"Видео #{job['id']} не обработано: {str(e)[:200]}")
+                why = explain(e)
+                log.debug("видео #%d", job["id"], exc_info=True)  # трассировка — только в файл лога
+                log.error("🔗 видео #%d не обработано: %s", job["id"], why)
+                self.update(job["id"], status="failed", progress="ошибка", error=why[:500])
+                await self.app.alert(f"video:{job['id']}", f"Видео #{job['id']} не обработано: {why}")
 
     # ---------- обработка ----------
     async def process(self, job: dict) -> int:

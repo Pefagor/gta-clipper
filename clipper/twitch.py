@@ -84,9 +84,13 @@ class TwitchAPI:
         try:
             out, _ = await asyncio.wait_for(proc.communicate(), 40)
             data = json.loads(out or b"{}")
-        except asyncio.TimeoutError:
-            proc.kill()
-            await proc.wait()
+        except (asyncio.TimeoutError, asyncio.CancelledError) as e:
+            # таймаут или остановка программы — не оставляем висящий процесс
+            if proc.returncode is None:
+                proc.kill()
+                await asyncio.shield(proc.wait())
+            if isinstance(e, asyncio.CancelledError):
+                raise
             return None
         except ValueError:
             return None
