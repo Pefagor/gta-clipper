@@ -78,6 +78,8 @@ class App:
         self._tasks: list[asyncio.Task] = []
         self._bg: set[asyncio.Task] = set()
         self._started_at = time.time()
+        from .video_jobs import VideoJobs
+        self.videos = VideoJobs(self)
         (cfg.data_dir / "sessions").mkdir(exist_ok=True)
         # сессии, оборванные падением или закрытием окна, считаем завершёнными — иначе уборка их не тронет
         self.db.execute("UPDATE sessions SET ended_at=? WHERE ended_at IS NULL", (time.time(),))
@@ -166,7 +168,7 @@ class App:
                  self._stage("to_cut", self._do_cut), self._stage("cut", self._do_transcribe),
                  self._stage("transcribed", self._do_screen, max_attempts=6),
                  self._stage("screened", self._do_review, max_attempts=6),
-                 self._stage("to_render", self._do_render)]
+                 self._stage("to_render", self._do_render), self.videos.loop()]
         if self.twitch.enabled:
             loops.append(self._clips_loop())
         self._tasks = [asyncio.create_task(c) for c in loops]
@@ -450,8 +452,12 @@ class App:
         d = Path(c["dir"])
         tr = json.loads((d / "transcript.json").read_text(encoding="utf-8"))
         t0, dur = c["raw_start_ts"], c["raw_duration"]
-        chat = [(t - t0, m) for t, m in self.chat.window(c["channel"], t0, t0 + dur)]
-        if not chat and t0 < self._started_at:  # окно до перезапуска программы — читаем лог сессии
+        if c.get("video_id"):  # кандидат из видео по ссылке: чат записи стрима сохранён рядом
+            p = d / "chat.json"
+            chat = [tuple(x) for x in json.loads(p.read_text(encoding="utf-8"))] if p.exists() else []
+        else:
+            chat = [(t - t0, m) for t, m in self.chat.window(c["channel"], t0, t0 + dur)]
+        if not chat and not c.get("video_id") and t0 < self._started_at:  # окно до перезапуска программы — читаем лог сессии
             chat = await asyncio.to_thread(self._chat_from_log, c, t0, dur)
         return build_context(c["channel"], c.get("game") or "", transcript_text(tr), chat, c.get("signals") or {},
                              c["peak_ts"] - t0, dur, screen, name=self.streamer_name(c["channel"]))
@@ -550,7 +556,8 @@ class App:
         t0 = time.time()
         await render_clip(self.ffmpeg, self.encoder, raw, out, start, end, info["width"], info["height"], cam,
                           words_in(tr, start, end), video_caption(c),
-                          f"twitch.tv/{c['channel']}", self.cfg.section("render"), top_media=top_media)
+                          c.get("credit") or f"twitch.tv/{c['channel']}", self.cfg.section("render"),
+                          top_media=top_media, badge=f"ЧАСТЬ {c['part']}" if c.get("part") else "")
         log.info("✅ #%d клип готов за %.0f с (%.1f МБ) → на модерацию", c["id"], time.time() - t0,
                  out.stat().st_size / 1e6)
         self.db.update_candidate(c["id"], status="rendered", render_path=str(out), render_duration=end - start,
@@ -814,7 +821,9 @@ class App:
             self.db.update_candidate(cid, status="cut", attempts=0, error=None, next_try_at=0)
             return "на распознавание речи"
         screen, review = c.get("screen") or {}, c.get("review") or {}
-        if isinstance(review, dict) and review.get("titles"):  # Sonnet уже выбрал границы — берём их
+        if c.get("part"):  # часть видео — целиком, со своим заголовком
+            start, end, titles = 0.0, c["raw_duration"], c.get("titles") or [c.get("title") or "Часть"]
+        elif isinstance(review, dict) and review.get("titles"):  # Sonnet уже выбрал границы — берём их
             start, end, titles = review["start"], review["end"], review["titles"]
         else:
             summary = (screen.get("summary") if isinstance(screen, dict) else "") or "Момент со стрима"

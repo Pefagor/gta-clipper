@@ -20,11 +20,14 @@ from aiogram.types import (CallbackQuery, FSInputFile, InlineKeyboardButton, Inl
 
 from .db import day_start
 from .version import full_version
+from .videos import fmt_ts
+from .video_jobs import MODES
 
 log = logging.getLogger(__name__)
 
 BTN_MOD, BTN_PUB, BTN_CH, BTN_ST, BTN_SET = "🎬 Модерация", "📤 Публикация", "📺 Каналы", "📊 Статус", "⚙️ Настройки"
 BTN_OUT = "🗂 Отсеянные"
+BTN_VID = "🔗 Видео"
 PAGE = 8
 CAM_MODES = {"auto": "авто", "off": "выкл", "media": "заставка"}
 CAT_ICON = {"смешное": "😂", "рейдж": "🤬", "баг": "🐞", "погоня": "🚓", "реакция": "😱", "эпичное": "🔥", "подборка": "🎞",
@@ -39,7 +42,8 @@ def kb(rows) -> InlineKeyboardMarkup:
 
 MAIN_KB = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text=BTN_MOD), KeyboardButton(text=BTN_PUB)],
                                         [KeyboardButton(text=BTN_CH), KeyboardButton(text=BTN_ST)],
-                                        [KeyboardButton(text=BTN_OUT), KeyboardButton(text=BTN_SET)]],
+                                        [KeyboardButton(text=BTN_VID), KeyboardButton(text=BTN_OUT)],
+                                        [KeyboardButton(text=BTN_SET)]],
                               resize_keyboard=True, is_persistent=True)
 
 
@@ -48,6 +52,7 @@ class Input(StatesGroup):
     title = State()
     overlay_text = State()
     alias = State()
+    video_url = State()
     hashtags = State()
     limit = State()
     overlay = State()
@@ -228,10 +233,12 @@ class BotUI:
         r.message.register(self.on_status, F.text == BTN_ST)
         r.message.register(self.on_settings, F.text == BTN_SET)
         r.message.register(self.on_rejected, F.text == BTN_OUT)
+        r.message.register(self.on_videos, F.text == BTN_VID)
         r.message.register(self.in_add_channel, Input.add_channel)
         r.message.register(self.in_title, Input.title)
         r.message.register(self.in_overlay_text, Input.overlay_text)
         r.message.register(self.in_alias, Input.alias)
+        r.message.register(self.in_video_url, Input.video_url)
         r.message.register(self.in_hashtags, Input.hashtags)
         r.message.register(self.in_limit, Input.limit)
         r.message.register(self.in_overlay, Input.overlay)
@@ -248,8 +255,11 @@ class BotUI:
         if c.get("spoiler"):
             lines.append("🔞 <b>СПОЙЛЕР</b>")
         who = c["channel"] if c["kind"] == "clip" else "подборка: " + c["channel"]
+        when = (f"🔗 видео #{c['video_id']}, {fmt_ts(c.get('video_pos') or 0)}"
+                + (f" · 🧩 часть {c['part']}" if c.get("part") else "")) if c.get("video_id") else \
+            f"🕐 {ago(c.get('peak_ts') or c.get('created_at'))}"
         lines.append(f"📺 <b>{html.escape(who)}</b> · {CAT_ICON.get(cat, '🎬')} {html.escape(cat)} · {rating(c)}"
-                     f" · 🕐 {ago(c.get('peak_ts') or c.get('created_at'))}")
+                     f" · {when}")
         if c.get("game"):
             lines.append(f"🎮 {html.escape(c['game'])}")
         lines.append(f"«{html.escape(c.get('title') or '')}»")
@@ -545,7 +555,9 @@ class BotUI:
         short, game_tags = game_meta(c.get("game"), self.app.cfg.get("games") or {})
         tags = " ".join(t for t in (game_tags, self.app.setting("hashtags") or "") if t)[:200]
         title = (c.get("title") or "Момент со стрима")[:90]
-        if c["kind"] == "clip":
+        if c["kind"] == "clip" and c.get("video_id"):
+            credit = f"Источник: {c.get('credit') or ''} {c.get('source_url') or ''}".strip()[:250]
+        elif c["kind"] == "clip":
             credit = f"Стрим: twitch.tv/{c['channel']}"
         else:
             credit = (c.get("description") or "")[:250]
@@ -965,6 +977,59 @@ class BotUI:
                 media=InputMediaPhoto(media=FSInputFile(photo), caption=caption),
                 reply_markup=self._cam_adjust_kb(login)))
         await self._safe(q.answer())
+
+    # ================= видео по ссылке =================
+    STATUS_ICON = {"queued": "⏳", "downloading": "⬇️", "transcribing": "🗣", "analyzing": "🔎", "done": "✅",
+                   "failed": "❗"}
+
+    def _videos_view(self) -> tuple[str, InlineKeyboardMarkup]:
+        jobs = self.app.videos.list(8)
+        lines = ["🔗 <b>Видео по ссылке</b>",
+                 "YouTube, запись стрима Twitch или свой файл (путь на диске ПК). Два режима:",
+                 "⭐ <b>лучшие моменты</b> — по «самым пересматриваемым» местам YouTube, крикам, чату записи и ИИ;",
+                 "🧩 <b>на части</b> — всё видео частями ~75 с с надписью «Часть N/M».", ""]
+        for j in jobs:
+            name = html.escape((j.get("title") or j["url"])[:45])
+            lines.append(f"{self.STATUS_ICON.get(j['status'], '•')} #{j['id']} {name} · {MODES.get(j['mode'])} · "
+                         f"{html.escape(j.get('progress') or '')}"
+                         + (f"\n   ошибка: {html.escape((j.get('error') or '')[:150])}" if j["status"] == "failed" else ""))
+        if not jobs:
+            lines.append("Пока пусто.")
+        return "\n".join(lines), kb([[("➕ Обработать ссылку", "vd:add:0"), ("🔄 Обновить", "vd:list:0")]])
+
+    async def on_videos(self, m: Message, state: FSMContext):
+        await state.clear()
+        text, markup = self._videos_view()
+        await m.answer(text, reply_markup=markup, disable_web_page_preview=True)
+
+    async def cb_vd(self, q, state, action, arg, parts):
+        if action == "list":
+            text, markup = self._videos_view()
+            await self._safe(q.message.edit_text(text, reply_markup=markup, disable_web_page_preview=True))
+        elif action == "add":
+            await state.set_state(Input.video_url)
+            await q.message.answer("Пришлите ссылку на видео (YouTube или запись стрима Twitch) "
+                                   "или полный путь к файлу на этом компьютере.")
+        elif action == "mode":
+            data = await state.get_data()
+            url = data.get("video_url")
+            await state.clear()
+            if not url:
+                return await q.answer("Ссылка потерялась — пришлите её ещё раз", show_alert=True)
+            vid = self.app.videos.add(url, arg)
+            await self._safe(q.message.edit_text(
+                f"✅ Видео #{vid} в очереди — {MODES.get(arg)}. Прогресс — в разделе 🔗 Видео, "
+                "найденное придёт на модерацию.", disable_web_page_preview=True))
+        await self._safe(q.answer())
+
+    async def in_video_url(self, m: Message, state: FSMContext):
+        url = (m.text or "").strip()
+        if not (url.startswith(("http://", "https://")) or Path(url).expanduser().exists()):
+            return await m.answer("Это не ссылка и не путь к файлу. Пришлите ссылку вида https://… "
+                                  "или откройте другой раздел меню.")
+        await state.update_data(video_url=url)
+        await m.answer("Что сделать с видео?", reply_markup=kb([[("⭐ Лучшие моменты", "vd:mode:best")],
+                                                               [("🧩 Нарезать на части", "vd:mode:parts")]]))
 
     # ================= отсеянные =================
     def _rejected_view(self, page: int) -> tuple[str, InlineKeyboardMarkup]:

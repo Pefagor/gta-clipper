@@ -46,6 +46,8 @@ CREATE TABLE IF NOT EXISTS candidates (
     titles TEXT, title TEXT, description TEXT,
     category TEXT, tag TEXT, spoiler INTEGER DEFAULT 0, game TEXT,
     overlay_text TEXT,                          -- надпись в начале видео: NULL = как заголовок, '' = без надписи
+    video_id INTEGER, part TEXT,                -- кандидат из «видео по ссылке»; part — «3/12» в режиме частей
+    credit TEXT, source_url TEXT, video_pos REAL,
     render_path TEXT, render_duration REAL,
     parts TEXT,
     error TEXT,
@@ -65,6 +67,15 @@ CREATE TABLE IF NOT EXISTS spend (
     ts REAL, model TEXT, in_tok INTEGER, out_tok INTEGER, cost_rub REAL
 );
 CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT);
+CREATE TABLE IF NOT EXISTS videos (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    url TEXT NOT NULL, mode TEXT NOT NULL,          -- best | parts
+    status TEXT NOT NULL,                           -- queued | downloading | transcribing | analyzing | done | failed
+    progress TEXT, error TEXT,
+    title TEXT, uploader TEXT, channel TEXT, credit TEXT, source_url TEXT, game TEXT,
+    duration REAL, dir TEXT, n_clips INTEGER,
+    created_at REAL, updated_at REAL
+);
 """
 
 JSON_FIELDS = {"signals", "screen", "review", "titles", "parts"}
@@ -85,8 +96,10 @@ class DB:
         cols = {r[1] for r in self.conn.execute("PRAGMA table_info(candidates)")}
         if "game" not in cols:
             self.conn.execute("ALTER TABLE candidates ADD COLUMN game TEXT")
-        if "overlay_text" not in cols:
-            self.conn.execute("ALTER TABLE candidates ADD COLUMN overlay_text TEXT")
+        for col, typ in (("overlay_text", "TEXT"), ("video_id", "INTEGER"), ("part", "TEXT"), ("credit", "TEXT"),
+                         ("source_url", "TEXT"), ("video_pos", "REAL")):
+            if col not in cols:
+                self.conn.execute(f"ALTER TABLE candidates ADD COLUMN {col} {typ}")
         ch_cols = {r[1] for r in self.conn.execute("PRAGMA table_info(channels)")}
         if "cam_mode" not in ch_cols:
             self.conn.execute("ALTER TABLE channels ADD COLUMN cam_mode TEXT")

@@ -177,10 +177,57 @@ class RouterAI:
                 "spoiler": as_bool(res.get("spoiler"), False), "titles": titles,
                 "tag": str(res.get("tag") or "").strip()[:40], "description": str(res.get("description") or "")[:200]}
 
+    async def find_moments(self, video_title: str, author: str, game: str, chunk_text: str) -> list[dict]:
+        from .videos import parse_ts
+        content = [{"type": "text", "text": f"Видео: {video_title}\nАвтор: {author}\nИгра: {game or 'неизвестно'}\n\n"
+                                            f"Фрагмент расшифровки:\n{chunk_text}"}]
+        res = await self.chat(self.cfg["screen_model"], MOMENTS_SYSTEM, content, 1500)
+        out = []
+        for m in res.get("moments") or []:
+            s, e = parse_ts(m.get("start")), parse_ts(m.get("end"))
+            if s is None or e is None or e <= s:
+                continue
+            try:
+                score = as_score(m.get("score", 5))
+            except LLMError:
+                score = 5
+            out.append({"start": s, "end": e, "score": score, "title": str(m.get("title") or "")[:80],
+                        "why": str(m.get("why") or "")[:200]})
+        return out
+
+    async def title_parts(self, video_title: str, author: str, parts: list[tuple[int, str]]) -> dict[int, dict]:
+        """parts: [(номер, начало текста части)] → {номер: {"title", "score"}}."""
+        text = "\n\n".join(f"Часть {n}:\n{t[:500] or '(без речи)'}" for n, t in parts)
+        content = [{"type": "text", "text": f"Видео: {video_title}\nАвтор: {author}\n\n{text}"}]
+        res = await self.chat(self.cfg["screen_model"], PARTS_SYSTEM, content, 2000)
+        out = {}
+        for p in res.get("parts") or []:
+            try:
+                out[int(p.get("n"))] = {"title": str(p.get("title") or "")[:60], "score": as_score(p.get("score", 5))}
+            except (TypeError, ValueError, LLMError):
+                continue
+        return out
+
     async def list_models(self) -> list[str]:
         r = await self.http.get("/models", headers={"Authorization": f"Bearer {self.api_key}"}, timeout=15)
         r.raise_for_status()
         return [m.get("id") for m in r.json().get("data", [])]
+
+
+MOMENTS_SYSTEM = """Ты ищешь в расшифровке длинного видео (запись стрима или ролик с YouTube) моменты для коротких
+вертикальных роликов (TikTok, Shorts) для русскоязычной аудитории: смешное, неожиданное, эпичное, рейдж, яркая реакция,
+сильная фраза, интересный факт. Скучные объяснения, реклама, заставки — не нужны.
+Пометки в тексте: (ПИК ПРОСМОТРОВ) — место, которое зрители пересматривают чаще всего; (КРИК) — громкое место;
+(ЧАТ) — всплеск сообщений в чате. Это подсказки, а не приказ.
+Верни ТОЛЬКО JSON: {"moments": [{"start": "мм:сс", "end": "мм:сс", "score": <1-10>, "title": "<заголовок до 60
+символов, автора называй по имени, а не «стример»>", "why": "<одна фраза>"}]}
+Каждый момент — законченная мини-история 20-90 секунд (завязка → развязка). Обычно 0-4 момента на фрагмент;
+если ничего яркого нет — пустой список."""
+
+PARTS_SYSTEM = """Видео нарезано на части для серии коротких роликов «Часть 1, 2, 3…». Для каждой части дай короткий
+цепляющий заголовок на русском (до 50 символов, без номера части, автора называй по имени) и оценку 1-10:
+насколько часть интересна сама по себе (8-10 — яркая, 4-7 — нормальная, 1-3 — проходная: вступление, реклама, пауза).
+Ответь ТОЛЬКО JSON: {"parts": [{"n": <номер>, "title": "...", "score": <1-10>}]}"""
 
 
 def build_context(channel: str, game: str, transcript: str, chat: list[tuple[float, str]], signals: dict,

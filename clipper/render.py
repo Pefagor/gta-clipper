@@ -57,10 +57,11 @@ def subtitle_events(words: list[dict], hold_gap: float = 0.6, tail: float = 0.3)
 
 
 def build_ass(words: list[dict], title: str, credit: str, has_cam: bool, font: str = "Arial",
-              title_seconds: float = 2.5, width: int = 1080, height: int = 1920) -> str:
+              title_seconds: float = 2.5, width: int = 1080, height: int = 1920, badge: str = "") -> str:
     """words — со временем относительно начала ролика."""
     sub_margin = 420 if has_cam else 520
     title_margin = CAM_H + 40 if has_cam else 300
+    badge_margin = CAM_H + 150 if has_cam else 200
     sub_y = height - sub_margin  # нижний край строки субтитров — всегда в одной точке
     head = f"""[Script Info]
 ScriptType: v4.00+
@@ -74,6 +75,7 @@ Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour,
 Style: Sub,{font},78,&H00FFFFFF,&H00FFFFFF,&H00000000,&H80000000,1,0,0,0,100,100,0,0,1,6,2,2,60,60,{sub_margin},1
 Style: Title,{font},70,&H0000E5FF,&H0000E5FF,&H00000000,&H80000000,1,0,0,0,100,100,0,0,1,6,3,8,70,70,{title_margin},1
 Style: Credit,{font},40,&H30FFFFFF,&H30FFFFFF,&H80000000,&H00000000,1,0,0,0,100,100,0,0,1,3,0,2,40,40,70,1
+Style: Badge,{font},48,&H00FFFFFF,&H00FFFFFF,&H00000000,&H90000000,1,0,0,0,100,100,2,0,3,10,0,9,40,40,{badge_margin},1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -83,6 +85,8 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         events.append(f"Dialogue: 2,{_ass_time(0)},{_ass_time(title_seconds)},Title,,0,0,0,,{_esc(title)}")
     if credit:
         events.append(f"Dialogue: 1,{_ass_time(0)},{_ass_time(3600)},Credit,,0,0,0,,{_esc(credit)}")
+    if badge:  # «ЧАСТЬ 3/12» — весь ролик, справа сверху над игрой
+        events.append(f"Dialogue: 1,{_ass_time(0)},{_ass_time(3600)},Badge,,0,0,0,,{_esc(badge)}")
     # \pos — фиксированная точка: позиционированные строки libass не сдвигает при наложениях
     pos = f"{{\\an2\\pos({width // 2},{sub_y})}}"
     for start, end, text in subtitle_events(words):
@@ -130,14 +134,14 @@ def target_kbps(duration: float, max_mb: float, max_kbps: int, audio_kbps: int =
 
 async def render_clip(ffmpeg: str, encoder: str, raw: Path, out: Path, start: float, end: float,
                       src_w: int, src_h: int, cam, words: list[dict], title: str, credit: str,
-                      rcfg: dict, top_media: Path | None = None) -> Path:
+                      rcfg: dict, top_media: Path | None = None, badge: str = "") -> Path:
     """cam — рамка вебки в исходнике; top_media — картинка/видео вместо вебки (важнее cam)."""
     work = out.parent
     work.mkdir(parents=True, exist_ok=True)
     rel_words = [{**w, "start": w["start"] - start, "end": w["end"] - start}
                  for w in words if w["end"] > start and w["start"] < end]
     (work / "subs.ass").write_text(build_ass(rel_words, title, credit, bool(cam or top_media),
-                                             rcfg.get("font", "Arial")),
+                                             rcfg.get("font", "Arial"), badge=badge),
                                    encoding="utf-8")
     dur = end - start
     kbps = target_kbps(dur, rcfg.get("max_file_mb", 45), rcfg.get("max_video_kbps", 8000))

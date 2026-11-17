@@ -134,6 +134,13 @@ async def cmd_doctor(cfg) -> int:
                 line(ok, f"пробный запрос к {name}: " + ("работает" if ok else f"HTTP {r.status_code} {r.text[:200]}"))
             except Exception as e:  # noqa: BLE001
                 line(False, f"пробный запрос к {name}: {e}")
+    try:
+        import yt_dlp
+        line(True, f"yt-dlp {yt_dlp.version.__version__} (видео по ссылке)")
+    except ImportError:
+        line(False, "yt-dlp не установлен: pip install -e .")
+    line(bool(shutil.which("deno")), "deno — нужен yt-dlp для YouTube (Windows: winget install DenoLand.Deno; "
+                                     "Mac: brew install deno), без него часть качеств недоступна")
     free = shutil.disk_usage(cfg.data_dir).free / 1e9
     line(free > 50, f"свободно на диске: {free:.0f} ГБ")
     return 0 if ok else 1
