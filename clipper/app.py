@@ -454,7 +454,7 @@ class App:
         if not chat and t0 < self._started_at:  # окно до перезапуска программы — читаем лог сессии
             chat = await asyncio.to_thread(self._chat_from_log, c, t0, dur)
         return build_context(c["channel"], c.get("game") or "", transcript_text(tr), chat, c.get("signals") or {},
-                             c["peak_ts"] - t0, dur, screen)
+                             c["peak_ts"] - t0, dur, screen, name=self.streamer_name(c["channel"]))
 
     def _chat_from_log(self, c: dict, t0: float, dur: float) -> list[tuple[float, str]]:
         sess = self.db.one("SELECT dir FROM sessions WHERE id=?", (c["session_id"],))
@@ -483,8 +483,8 @@ class App:
         if not self.llm.enabled:  # без ключа routerai: пропускаем ИИ, на модерацию идёт всё окно
             log.info("🤖 #%d ИИ-отбор выключен (нет ключа routerai) — беру фрагмент целиком", c["id"])
             self.db.update_candidate(c["id"], status="to_render", screen={"skipped": True}, clip_start=0.0,
-                                     clip_end=c["raw_duration"], titles=["Момент со стрима"],
-                                     title="Момент со стрима",
+                                     clip_end=c["raw_duration"], titles=[f"{self.streamer_name(c['channel'])} на стриме"],
+                                     title=f"{self.streamer_name(c['channel'])} на стриме",
                                      category="рейдж" if c.get("trigger") == "rage" else "другое")
             return
         if not await self._budget_ok(c):
@@ -824,6 +824,11 @@ class App:
                                  error=None, next_try_at=0, edit_start=None, edit_end=None)
         log.info("♻️  #%d возвращён из отсеянных — в монтаж и на модерацию", cid)
         return "в монтаж, потом придёт на модерацию"
+
+    def streamer_name(self, login: str) -> str:
+        """Как называть стримера в заголовках: своё имя из бота → имя на Twitch → ник."""
+        ch = self.db.channel(login) or {}
+        return (ch.get("alias") or ch.get("display_name") or login).strip()
 
     # ---------- режим вебки и заставки ----------
     def cam_mode(self, login: str) -> str:

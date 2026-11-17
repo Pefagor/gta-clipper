@@ -72,7 +72,7 @@ ScaledBorderAndShadow: yes
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
 Style: Sub,{font},78,&H00FFFFFF,&H00FFFFFF,&H00000000,&H80000000,1,0,0,0,100,100,0,0,1,6,2,2,60,60,{sub_margin},1
-Style: Title,{font},62,&H00FFFFFF,&H00FFFFFF,&H00000000,&H00000000,1,0,0,0,100,100,0,0,3,14,0,8,70,70,{title_margin},1
+Style: Title,{font},70,&H0000E5FF,&H0000E5FF,&H00000000,&H80000000,1,0,0,0,100,100,0,0,1,6,3,8,70,70,{title_margin},1
 Style: Credit,{font},40,&H30FFFFFF,&H30FFFFFF,&H80000000,&H00000000,1,0,0,0,100,100,0,0,1,3,0,2,40,40,70,1
 
 [Events]

@@ -18,6 +18,7 @@ CREATE TABLE IF NOT EXISTS channels (
     removed_at REAL,
     cam_status TEXT NOT NULL DEFAULT 'unknown', -- unknown | pending | ok | none
     cam_mode TEXT,                              -- NULL = как по умолчанию | auto | off | media
+    alias TEXT,                                 -- как стримера называть в заголовках (NULL = ник)
     cam_x REAL, cam_y REAL, cam_w REAL, cam_h REAL
 );
 CREATE TABLE IF NOT EXISTS sessions (
@@ -89,6 +90,8 @@ class DB:
         ch_cols = {r[1] for r in self.conn.execute("PRAGMA table_info(channels)")}
         if "cam_mode" not in ch_cols:
             self.conn.execute("ALTER TABLE channels ADD COLUMN cam_mode TEXT")
+        if "alias" not in ch_cols:
+            self.conn.execute("ALTER TABLE channels ADD COLUMN alias TEXT")
 
     # --- низкий уровень ---
     def execute(self, sql: str, params: tuple | list = ()) -> sqlite3.Cursor:

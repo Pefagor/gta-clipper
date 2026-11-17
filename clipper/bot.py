@@ -47,6 +47,7 @@ class Input(StatesGroup):
     add_channel = State()
     title = State()
     overlay_text = State()
+    alias = State()
     hashtags = State()
     limit = State()
     overlay = State()
@@ -230,6 +231,7 @@ class BotUI:
         r.message.register(self.in_add_channel, Input.add_channel)
         r.message.register(self.in_title, Input.title)
         r.message.register(self.in_overlay_text, Input.overlay_text)
+        r.message.register(self.in_alias, Input.alias)
         r.message.register(self.in_hashtags, Input.hashtags)
         r.message.register(self.in_limit, Input.limit)
         r.message.register(self.in_overlay, Input.overlay)
@@ -496,6 +498,17 @@ class BotUI:
         await self._set_overlay(cid, "" if arg == "none" else None)
         await q.answer("Перемонтирую без надписи" if arg == "none" else "Надпись = заголовок, перемонтирую")
 
+    async def in_alias(self, m: Message, state: FSMContext):
+        data = await state.get_data()
+        await state.clear()
+        login = data.get("login")
+        text = " ".join((m.text or "").split())[:40]
+        if not login or not text:
+            return await m.answer("Пустое имя — оставил как было.", reply_markup=MAIN_KB)
+        self.db.update_channel(login, alias=None if text == "-" else text)
+        await m.answer(f"В заголовках канала {html.escape(login)} теперь: «{html.escape(self.app.streamer_name(login))}». "
+                       "Действует для новых клипов.", reply_markup=MAIN_KB)
+
     async def in_overlay_text(self, m: Message, state: FSMContext):
         data = await state.get_data()
         await state.clear()
@@ -736,7 +749,9 @@ class BotUI:
         clips = self.db.scalar("SELECT COUNT(*) FROM candidates WHERE channel=? AND decided_at>=? AND status IN "
                                "('approved','sent','done')", (login, today)) or 0
         cands = self.db.scalar("SELECT COUNT(*) FROM candidates WHERE channel=? AND created_at>=?", (login, today)) or 0
-        text = f"{head}\nВебка: {cam} · Клипов сегодня: {clips} · Кандидатов: {cands}"
+        text = (f"{head}\nВ заголовках: «{html.escape(self.app.streamer_name(login))}»"
+                f"{'' if ch.get('alias') else ' (имя с Twitch)'}\n"
+                f"Вебка: {cam} · Клипов сегодня: {clips} · Кандидатов: {cands}")
         pause = ("▶️ Продолжить", f"ch:resume:{login}") if ch["state"] == "paused" else ("⏸ Пауза", f"ch:pause:{login}")
         own = ch.get("cam_mode")
         mode_label = f"🎥 Режим: {CAM_MODES[own]}" if own else "🎥 Режим: по умолчанию"
@@ -748,6 +763,7 @@ class BotUI:
                         + ([("✏️ Подправить рамку", f"cam:adjnew:{login}")] if self.db.kv_get(f"cam:{login}") else []))
         if self.app.overlay_path(login):
             rows[1].append(("🗑 Убрать заставку", f"ch:ovldel:{login}"))
+        rows.append([("✏️ Имя в заголовках", f"ch:alias:{login}")])
         rows.append([("🗑 Удалить", f"ch:del:{login}"), ("← Назад", "ch:list:0")])
         return text, kb(rows)
 
@@ -789,6 +805,11 @@ class BotUI:
             text, markup = self._channels_view()
             note = "Удалён." if action == "delnow" else "Удалится после конца стрима."
             await self._safe(q.message.edit_text(f"{note}\n\n{text}", reply_markup=markup))
+        elif action == "alias":
+            await state.set_state(Input.alias)
+            await state.update_data(login=login)
+            await q.message.answer("Как зрители знают этого стримера? Пришлите имя для заголовков "
+                                   "(например, «Старый Бог»). Отправьте «-», чтобы вернуть имя с Twitch.")
         elif action == "cmode":  # по умолчанию → авто → выкл → заставка → по умолчанию
             order = [None, "auto", "off", "media"]
             cur = (self.db.channel(login) or {}).get("cam_mode")
