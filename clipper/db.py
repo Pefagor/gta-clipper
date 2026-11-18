@@ -19,6 +19,8 @@ CREATE TABLE IF NOT EXISTS channels (
     cam_status TEXT NOT NULL DEFAULT 'unknown', -- unknown | pending | ok | none
     cam_mode TEXT,                              -- NULL = как по умолчанию | auto | off | media
     alias TEXT,                                 -- как стримера называть в заголовках (NULL = ник)
+    platform TEXT NOT NULL DEFAULT 'twitch',    -- twitch | youtube
+    url TEXT,                                   -- адрес канала (для YouTube обязателен)
     cam_x REAL, cam_y REAL, cam_w REAL, cam_h REAL
 );
 CREATE TABLE IF NOT EXISTS sessions (
@@ -105,6 +107,10 @@ class DB:
             self.conn.execute("ALTER TABLE channels ADD COLUMN cam_mode TEXT")
         if "alias" not in ch_cols:
             self.conn.execute("ALTER TABLE channels ADD COLUMN alias TEXT")
+        if "platform" not in ch_cols:
+            self.conn.execute("ALTER TABLE channels ADD COLUMN platform TEXT NOT NULL DEFAULT 'twitch'")
+        if "url" not in ch_cols:
+            self.conn.execute("ALTER TABLE channels ADD COLUMN url TEXT")
 
     # --- низкий уровень ---
     def execute(self, sql: str, params: tuple | list = ()) -> sqlite3.Cursor:

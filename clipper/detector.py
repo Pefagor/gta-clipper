@@ -85,7 +85,10 @@ class ChannelDetector:
         if self.started_at is None:
             self.started_at = now
         chat_n, emote_n = count_recent(chat_history, now - win, now, c.get("emotes", []))
-        audio_db = mean_audio(audio, now - 3, now)
+        # громкость — по последним 3 с полученного звука: он приходит пачками, и «последние 3 с до сейчас»
+        # между пачками бывают пустыми (так YouTube-эфиры выглядели «тишиной»)
+        a_end = audio[-1][0] if audio and 0 <= now - audio[-1][0] < 10 else now
+        audio_db = mean_audio(audio, a_end - 3, a_end)
         if audio_db is not None and audio_db < SILENCE_DB:
             audio_db = None  # тишина (BRB, выключенный микрофон) не участвует в сравнении
         base = [s for s in self.samples if now - c.get("baseline_seconds", 600) <= s.t <= now - win]

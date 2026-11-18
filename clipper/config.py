@@ -28,6 +28,7 @@ class Secrets:
     twitch_client_secret: str = ""
     telegram_token: str = ""
     telegram_owner_id: int | None = None
+    youtube_key: str = ""
     routerai_key: str = ""
 
     @property
@@ -95,6 +96,7 @@ def load_config(path: Path | None = None, env_path: Path | None = None) -> Confi
         twitch_client_secret=os.getenv("TWITCH_CLIENT_SECRET", "").strip(),
         telegram_token=os.getenv("TELEGRAM_BOT_TOKEN", "").strip(),
         telegram_owner_id=int(owner) if owner.lstrip("-").isdigit() else None,
+        youtube_key=clean_key(os.getenv("YOUTUBE_API_KEY", "")),
         routerai_key=clean_key(os.getenv("ROUTERAI_API_KEY", "")),
     )
     return cfg

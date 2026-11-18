@@ -74,10 +74,13 @@ class TwitchAPI:
         return set(await self.live_info(logins))
 
     async def _streamlink_live(self, login: str) -> dict | None:
-        """None — не в эфире; иначе метаданные стрима (streamlink отдаёт категорию без ключей Twitch)."""
+        return await self.streamlink_live_url(f"https://twitch.tv/{login}")
+
+    async def streamlink_live_url(self, url: str) -> dict | None:
+        """None — не в эфире; иначе метаданные эфира: категория, название, id видео (YouTube)."""
         try:
             proc = await asyncio.create_subprocess_exec(
-                *self.streamlink, "--json", f"https://twitch.tv/{login}",
+                *self.streamlink, "--json", url,
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
         except OSError:
             return None
@@ -97,7 +100,8 @@ class TwitchAPI:
         if not data.get("streams"):
             return None
         meta = data.get("metadata") or {}
-        return {"game": meta.get("category") or "", "title": meta.get("title") or ""}
+        return {"game": meta.get("category") or "", "title": meta.get("title") or "", "id": meta.get("id") or "",
+                "author": meta.get("author") or ""}
 
     async def recent_clips(self, broadcaster_id: str, since: float) -> list[dict]:
         started = datetime.fromtimestamp(since, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")

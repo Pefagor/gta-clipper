@@ -126,3 +126,17 @@ def test_template_match_and_check_real_stream(tmp_path):
     assert abs(x - 0.7927) < 0.005 and y < 0.005 and abs(w - 0.2073) < 0.01 and abs(h - 0.2639) < 0.01
     assert check_cam([0.7927, 0.0, 0.2068, 0.2639], frames[:8])["present"] is True
     assert check_cam([0.35, 0.35, 0.2, 0.26], frames[:8])["present"] is False
+
+
+def test_bursty_audio_is_not_silence():
+    """Звук пачками по 5 с (YouTube): между пачками детектор не должен считать эфир тишиной."""
+    cfg = {"window_seconds": 10, "baseline_seconds": 600, "warmup_seconds": 0, "emotes": [],
+           "weights": {"chat": 2, "audio": 1.5, "emotes": 1}}
+    det = ChannelDetector(cfg)
+    hist, audio = deque(), deque()
+    for k in range(300):  # пачки: 10 кусков по 0.5 с, приходят раз в 5 с
+        if k % 10 == 0:
+            for j in range(10):
+                audio.append((1000 + k * 0.5 - 5 + j * 0.5, -20.0))
+    _, sig = det.tick(1000 + 299 * 0.5 + 4.0, hist, audio, [])   # 4 с после последней пачки
+    assert sig["audio_db"] == -20.0

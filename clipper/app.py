@@ -18,6 +18,8 @@ from .db import DB, day_start
 from .errors import explain
 from .detector import ChannelDetector, OpenWindow, extend_window, plan_window
 from .llm import LLMAuthError, LLMError, RouterAI, build_context
+from .platforms import credit as platform_credit, game_from_category, link as platform_link, live_url, \
+    parse_channel, platform_of
 from .recorder import Recorder
 from .render import render_clip, render_compilation
 from .segments import load_session_segments
@@ -65,6 +67,9 @@ class App:
         s = cfg.secrets
         self.twitch = TwitchAPI(s.twitch_client_id, s.twitch_client_secret, streamlink_cmd(cfg.get("streamlink", "auto")))
         self.chat = ChatHub()
+        from .ytchat import YouTubeChat
+        self.ytchat = YouTubeChat(s.youtube_key, self.chat._store, cfg.section("youtube"),
+                                  on_alert=lambda k, t: self.alert(k, t, every=3600))
         self.llm = RouterAI(cfg.section("llm"), s.routerai_key, on_usage=self._on_usage)
         self.transcriber = Transcriber(cfg.section("whisper"))
         self.recorders: dict[str, Recorder] = {}
@@ -122,15 +127,15 @@ class App:
         self.db.add_spend(model, in_tok, out_tok, cost)
 
     # ---------- каналы ----------
-    async def add_channel(self, login: str) -> tuple[bool, str]:
-        login = login.strip().lower().removeprefix("@")
-        for pref in ("https://", "http://", "www.", "twitch.tv/", "m.twitch.tv/"):
-            login = login.removeprefix(pref)
-        login = login.split("/")[0].split("?")[0]
-        if not login or not all(ch.isalnum() or ch == "_" for ch in login):
-            return False, "Не похоже на ник Twitch."
+    async def add_channel(self, text: str) -> tuple[bool, str]:
+        parsed = parse_channel(text)
+        if not parsed:
+            return False, "Не похоже ни на ник Twitch, ни на ссылку на YouTube-канал (https://youtube.com/@канал)."
+        platform, login, url = parsed
         display, user_id = login, None
-        if self.twitch.enabled:
+        if platform == "youtube":
+            display = await self._youtube_channel_name(url) or login[3:]
+        elif self.twitch.enabled:
             try:
                 user = await self.twitch.user(login)
             except Exception as e:  # noqa: BLE001
@@ -143,12 +148,26 @@ class App:
             return False, f"{display} уже в списке."
         if existing:
             self.db.update_channel(login, state="active", removed_at=None, display_name=display,
-                                   user_id=user_id or existing.get("user_id"))
+                                   user_id=user_id or existing.get("user_id"), platform=platform, url=url)
         else:
-            self.db.execute("INSERT INTO channels(login,display_name,user_id,state,added_at) VALUES(?,?,?,?,?)",
-                            (login, display, user_id, "active", time.time()))
+            self.db.execute("INSERT INTO channels(login,display_name,user_id,state,added_at,platform,url) "
+                            "VALUES(?,?,?,?,?,?,?)", (login, display, user_id, "active", time.time(), platform, url))
         self.wake.set()
-        return True, display
+        return True, display + (" (YouTube)" if platform == "youtube" else "")
+
+    async def _youtube_channel_name(self, url: str) -> str:
+        """Название YouTube-канала (без скачивания видео, без квоты API)."""
+        def name():
+            import yt_dlp
+            from .videos import _YtdlpLog
+            with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True, "extract_flat": True, "playlistend": 1,
+                                   "logger": _YtdlpLog()}) as y:
+                info = y.extract_info(url, download=False)
+            return info.get("channel") or info.get("uploader") or info.get("title") or ""
+        try:
+            return (await asyncio.wait_for(asyncio.to_thread(name), 40)).removesuffix(" - Videos").strip()
+        except Exception:  # noqa: BLE001
+            return ""
 
     async def remove_channel(self, login: str, now: bool) -> None:
         if now or login not in self.recorders:
@@ -207,7 +226,13 @@ class App:
         for login in list(self.recorders):
             if login not in chans:
                 await self._stop_recording(login)
-        self.live = await self.twitch.live_info(list(chans))
+        tw = [l for l, c in chans.items() if platform_of(c, l) == "twitch"]
+        yt = [c for l, c in chans.items() if platform_of(c, l) == "youtube"]
+        self.live = await self.twitch.live_info(tw)
+        for ch, info in zip(yt, await asyncio.gather(*(self.twitch.streamlink_live_url(live_url(c)) for c in yt))):
+            if info is not None:
+                info["game"] = game_from_category(info.get("game"), "youtube")
+                self.live[ch["login"]] = info
         for login, info in self.live.items():
             rec = self.recorders.get(login)
             if rec and info.get("game") and info["game"] != rec.game:
@@ -240,13 +265,21 @@ class App:
         session_dir.mkdir(parents=True, exist_ok=True)
         sid = self.db.execute("INSERT INTO sessions(channel,dir,started_at) VALUES(?,?,?)",
                               (login, str(session_dir), time.time())).lastrowid
-        rec = Recorder(login, sid, session_dir, self.cfg, self.ffmpeg, on_alert=self._rec_alert)
+        ch = self.db.channel(login) or {"login": login}
+        rec = Recorder(login, sid, session_dir, self.cfg, self.ffmpeg, on_alert=self._rec_alert, url=live_url(ch))
         self.recorders[login] = rec
         self.detectors[login] = ChannelDetector(self.cfg.section("detector"))
         self.chat.set_log(login, session_dir / "chat.jsonl")
         rec.start()
-        await self.chat.join(login)
-        log.info("🔴 [%s] в эфире — начинаю запись", login)
+        if platform_of(ch, login) == "youtube":
+            vid = (self.live.get(login) or {}).get("id")
+            if self.ytchat.enabled and vid:
+                self.ytchat.start(login, vid)
+            elif not self.ytchat.enabled:
+                log.info("💬 [%s] чат YouTube не читаю — нет YOUTUBE_API_KEY; моменты ищу по звуку", login)
+        else:
+            await self.chat.join(login)
+        log.info("🔴 [%s] в эфире — начинаю запись%s", login, " (YouTube)" if platform_of(ch, login) == "youtube" else "")
 
     async def _stop_recording(self, login: str) -> None:
         rec = self.recorders.pop(login, None)
@@ -257,6 +290,7 @@ class App:
             log.info("⏹  [%s] запись остановлена", login)
         self.chat.set_log(login, None)
         await self.chat.part(login)
+        await self.ytchat.stop(login)
 
     async def _rec_alert(self, login: str, reason: str) -> None:
         await self.alert(f"rec:{login}", f"Запись {login} прерывается: {reason}",
@@ -280,15 +314,17 @@ class App:
                     if not rec.healthy:
                         continue
                     det = self.detectors[login]
-                    score, signals = det.tick(now, self.chat.history(login), rec.audio, list(self.clip_moments[login]))
+                    lag = self.ytchat.lag(login)  # чат YouTube приходит пачками раз в N секунд
+                    t_eval = now - lag
+                    score, signals = det.tick(t_eval, self.chat.history(login), rec.audio, list(self.clip_moments[login]))
                     self._status_line(login, rec, score, signals, thr)
                     self._maybe_calibrate(login, rec, now)
                     win = self.open_windows.get(login)
                     if score >= thr or signals.get("rage"):
                         # момент «по звуку» привязан к секунде крика, по чату — к «сейчас минус задержка чата»
-                        peak = signals.get("audio_peak_t") or now - dcfg.get("reaction_delay", 10)
+                        peak = signals.get("audio_peak_t") or t_eval - dcfg.get("reaction_delay", 10)
                         if win:
-                            extend_window(win, now, dcfg, peak)
+                            extend_window(win, t_eval, dcfg, peak)
                             self.last_end[login] = win.end
                             win.max_score = max(win.max_score, score)
                             self.db.update_candidate(win.cid, win_end=win.end, score=win.max_score,
@@ -321,8 +357,10 @@ class App:
         seg = float(self.cfg.section("recording").get("segment_seconds", 4))
         start, end = plan_window(peak, dcfg)
         start = max(start, rec.started_at, self.last_end.get(login, 0) if track else 0)
+        chrow = self.db.channel(login)
         cid = self.db.add_candidate(channel=login, session_id=rec.session_id, status="to_cut", trigger=trigger,
                                     game=rec.game or None,
+                                    credit=platform_credit(chrow, login) if platform_of(chrow, login) == "youtube" else None,
                                     peak_ts=peak, win_start=start, win_end=end, score=score, signals=signals,
                                     next_try_at=end + seg + 3)
         if track:
@@ -619,7 +657,8 @@ class App:
         cid = self.db.add_candidate(kind="compilation", channel=",".join(streamers), status="to_render", game=game or None,
                                     parts=[r["id"] for r in picked], title=title, titles=[title], tag=tag,
                                     category="подборка", score=max(r["score"] or 0 for r in picked),
-                                    description="Стримеры: " + ", ".join(f"twitch.tv/{s}" for s in streamers))
+                                    description="Стримеры: " + ", ".join(platform_link(self.db.channel(s), s)
+                                                                          for s in streamers))
         for r in picked:
             self.db.update_candidate(r["id"], in_compilation=1)
         return cid
@@ -689,7 +728,7 @@ class App:
             return False
         if not res.get("rect"):
             # лица нет (стример отошёл, заставка между играми) — не беспокоим, попробуем позже
-            log.info("🎥 [%s] лица в кадре нет (стример отошёл?) — поищу вебку через 5 минут", login)
+            log.info("🎥 [%s] лица в кадре нет (стример отошёл?) — поищу вебку через 2 минуты", login)
             return False
         # последний кадр — основа для перерисовки рамки при ручной подстройке
         shutil.copy(frames[-1], work / "base.jpg")

@@ -168,6 +168,17 @@ async def cmd_doctor(cfg) -> int:
         line(False, f"faster-whisper: {e}")
     s = cfg.secrets
     line(s.has_twitch, "ключи Twitch (без них нет клипов зрителей и проверки ников)")
+    if s.youtube_key:
+        import httpx
+        try:
+            r = httpx.get("https://www.googleapis.com/youtube/v3/videos",
+                          params={"part": "id", "id": "jNQXAC9IVRw", "key": s.youtube_key}, timeout=15, trust_env=False)
+            line(r.status_code == 200, "ключ YouTube API (чат YouTube-эфиров)" +
+                 ("" if r.status_code == 200 else f": HTTP {r.status_code} {r.text[:150]}"))
+        except Exception as e:  # noqa: BLE001
+            line(False, f"ключ YouTube API: {e}")
+    else:
+        print("   ключа YouTube API нет — YouTube-эфиры пишутся, но без чата (моменты по звуку)")
     line(bool(s.telegram_token), "токен Telegram-бота")
     line(bool(s.telegram_owner_id), "TELEGRAM_OWNER_ID")
     line(bool(s.routerai_key), "ключ routerai")

@@ -22,8 +22,9 @@ AUDIO_CHUNK = AUDIO_RATE // 2 * 2  # 0.5 с моно s16le в байтах
 
 class Recorder:
     def __init__(self, login: str, session_id: int, session_dir: Path, cfg, ffmpeg: str,
-                 on_alert=None):
+                 on_alert=None, url: str = ""):
         self.login = login
+        self.url = url or f"https://twitch.tv/{login}"  # для YouTube — https://www.youtube.com/@канал/live
         self.session_id = session_id
         self.session_dir = session_dir
         self.cfg = cfg
@@ -96,7 +97,7 @@ class Recorder:
         try:
             streamlink = await asyncio.create_subprocess_exec(
                 *streamlink_cmd(self.cfg.get("streamlink", "auto")), *(self.rec.get("streamlink_extra_args") or []),
-                "--loglevel", "warning", "-O", f"https://twitch.tv/{self.login}", self.rec.get("quality", "best"),
+                "--loglevel", "warning", "-O", self.url, self.rec.get("quality", "best"),
                 stdout=w_fd, stderr=sl_log)
             ffmpeg = await asyncio.create_subprocess_exec(
                 self.ffmpeg, "-hide_banner", "-loglevel", "warning", "-i", "pipe:0",
@@ -150,9 +151,17 @@ class Recorder:
                 buf += data
                 while len(buf) >= AUDIO_CHUNK:
                     chunk, buf = buf[:AUDIO_CHUNK], buf[AUDIO_CHUNK:]
-                    self.audio.append((time.time(), loudness_db(chunk)))
+                    self.audio.append((self._audio_clock(), loudness_db(chunk)))
         except asyncio.CancelledError:
             pass
+
+    def _audio_clock(self) -> float:
+        """Время очередного полусекундного куска звука. Звук приходит пачками (YouTube — по ~5 с разом),
+        поэтому время считаем по самому звуку (+0.5 с на кусок), не убегая вперёд часов и не отставая больше 8 с."""
+        now = time.time()
+        last = self.audio[-1][0] if self.audio else 0.0
+        t = min(now, max(last + 0.5, now - 8.0))
+        return t
 
     async def _kill(self) -> None:
         for p in self._procs:

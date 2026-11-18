@@ -19,6 +19,7 @@ from aiogram.types import (CallbackQuery, FSInputFile, InlineKeyboardButton, Inl
                            KeyboardButton, Message, ReplyKeyboardMarkup)
 
 from .db import day_start
+from .platforms import link as platform_link, platform_of
 from .version import full_version
 from .videos import fmt_ts
 from .video_jobs import MODES
@@ -558,7 +559,7 @@ class BotUI:
         if c["kind"] == "clip" and c.get("video_id"):
             credit = f"Источник: {c.get('credit') or ''} {c.get('source_url') or ''}".strip()[:250]
         elif c["kind"] == "clip":
-            credit = f"Стрим: twitch.tv/{c['channel']}"
+            credit = f"Стрим: {platform_link(self.db.channel(c['channel']), c['channel'])}"
         else:
             credit = (c.get("description") or "")[:250]
         shorts_t = (f"{title} | {short}" if short else title)[:100]
@@ -716,12 +717,12 @@ class BotUI:
             n = self.db.scalar("SELECT COUNT(*) FROM candidates WHERE channel=? AND decided_at>=? AND status IN "
                                "('approved','sent','done')", (login, today)) or 0
             if ch["state"] == "paused":
-                label = f"⏸ {ch['display_name'] or login} · на паузе"
+                label = f"⏸ {ch['display_name'] or login}{' ▶️YT' if platform_of(ch) == 'youtube' else ''} · на паузе"
             elif rec:
                 mins = int((time.time() - rec.started_at) / 60)
-                label = f"🔴 {ch['display_name'] or login} · {mins // 60}ч {mins % 60:02d}м · {n} клип."
+                label = f"🔴 {ch['display_name'] or login}{' ▶️YT' if platform_of(ch) == 'youtube' else ''} · {mins // 60}ч {mins % 60:02d}м · {n} клип."
             else:
-                label = f"⚫ {ch['display_name'] or login} · офлайн"
+                label = f"⚫ {ch['display_name'] or login}{' ▶️YT' if platform_of(ch) == 'youtube' else ''} · офлайн"
             if ch["state"] == "removing":
                 label += " · удалится"
             rows.append([(label, f"ch:open:{login}")])
@@ -786,7 +787,8 @@ class BotUI:
             await self._safe(q.message.edit_text(text, reply_markup=markup))
         elif action == "add":
             await state.set_state(Input.add_channel)
-            await q.message.answer("Пришлите ник канала или ссылку вида twitch.tv/ник.")
+            await q.message.answer("Пришлите ник Twitch (или ссылку twitch.tv/ник) либо ссылку на YouTube-канал "
+                                   "вида https://youtube.com/@канал.")
         elif action == "open":
             text, markup = self._channel_card(login)
             await self._safe(q.message.edit_text(text, reply_markup=markup))
