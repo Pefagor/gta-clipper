@@ -38,8 +38,8 @@ def test_pick_window_stops_at_gaps():
 
 def test_parse_privmsg():
     line = ("@badge-info=;tmi-sent-ts=1700000000123;user-id=1 :bob!bob@bob.tmi.twitch.tv PRIVMSG #SomeChan :KEKW ахаха")
-    ch, text, ts = parse_privmsg(line)
-    assert ch == "somechan" and text == "KEKW ахаха" and abs(ts - 1700000000.123) < 1e-6
+    ch, text, ts, user = parse_privmsg(line)
+    assert ch == "somechan" and text == "KEKW ахаха" and abs(ts - 1700000000.123) < 1e-6 and user == "bob"
     assert parse_privmsg(":tmi.twitch.tv 001 justinfan :Welcome") is None
 
 
@@ -114,3 +114,13 @@ def test_video_caption_independent_from_title():
     assert video_caption({**c, "overlay_text": "ОН ЭТО СДЕЛАЛ"}) == "ОН ЭТО СДЕЛАЛ"
     assert video_caption({**c, "overlay_text": ""}) == ""        # без надписи
     assert ",Title," not in build_ass([], video_caption({**c, "overlay_text": ""}), "twitch.tv/x", True)
+
+
+def test_chat_noise_and_laughter():
+    from clipper.chat import is_noise
+    from clipper.detector import is_laugh
+    assert is_noise("!язомби") and is_noise("+") and is_noise("ну как", "nightbot") and is_noise("hi", "m3wsu_bot")
+    assert not is_noise("KEKW") and not is_noise("ХАХАХА", "viewer123")
+    assert is_laugh("ХАХВЫАХФЫХАВФХАХФВАХ") and is_laugh("ахахаха))))") and not is_laugh("хорошо")
+    hist = [(1.0, "ХАХВЫАХФЫХ"), (2.0, "привет"), (3.0, "KEKW")]
+    assert count_recent(hist, 0, 10, ["kekw"]) == (3, 2)

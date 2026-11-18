@@ -19,6 +19,9 @@ SCREEN_SYSTEM = """Ты отбираешь моменты со стримов д
 Детектор заметил тут всплеск активности. Реши, есть ли здесь момент, который зайдёт как короткий ролик
 для русскоязычной аудитории: смешное, неожиданное, эпичное, баг, яркая реакция стримера.
 Скучная болтовня, загрузочные экраны, меню, реклама, просто спам эмоутами без события — низкая оценка.
+Если чат массово смеётся (KEKW, ХАХАХА, «ахвхахв») или пишет «???»/«ЧТО» — это сильный признак, что в кадре что-то
+произошло, даже если по речи стримера это не очевидно: смотри на кадры.
+Если даны решения владельца канала по прошлым кандидатам — его вкус важнее общих правил.
 В расшифровке есть пометки «(КРИК: ...)» — там стример орёт заметно громче обычного. Рейдж (стример
 бесится, орёт, ругается на игру) — хороший материал, категория «рейдж».
 Ответь ТОЛЬКО JSON без пояснений:
@@ -231,7 +234,8 @@ PARTS_SYSTEM = """Видео нарезано на части для серии 
 
 
 def build_context(channel: str, game: str, transcript: str, chat: list[tuple[float, str]], signals: dict,
-                  peak_rel: float, duration: float, screen: dict | None = None, name: str = "") -> str:
+                  peak_rel: float, duration: float, screen: dict | None = None, name: str = "",
+                  hints: str = "", taste: str = "") -> str:
     if len(chat) > 60:
         step = len(chat) / 60
         chat = [chat[int(i * step)] for i in range(60)]
@@ -239,6 +243,11 @@ def build_context(channel: str, game: str, transcript: str, chat: list[tuple[flo
     s = (f"Стример: {channel} (ник на Twitch)\nИмя для заголовков: {name or channel}\nИгра/категория: {game or 'неизвестно'}\nДлина фрагмента: {duration:.0f} с. Всплеск активности примерно на {peak_rel:.0f} с.\n"
          f"Сигналы детектора: {json.dumps(signals, ensure_ascii=False)}\n\n"
          f"Речь стримера:\n{transcript}\n\nЧат:\n{chat_txt}\n")
+    if hints:
+        s += f"\nЧто ценится в роликах по этой игре: {hints}\n"
+    if taste:
+        s += ("\nРешения владельца канала по прошлым кандидатам — подстраивайся под его вкус (оценивай так, "
+              f"как оценил бы он):\n{taste}\n")
     if screen:
         s += f"\nПервичный отбор: {json.dumps(screen, ensure_ascii=False)}\n"
     return s

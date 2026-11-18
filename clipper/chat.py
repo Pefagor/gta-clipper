@@ -14,8 +14,23 @@ log = logging.getLogger(__name__)
 HOST, PORT = "irc.chat.twitch.tv", 6667
 
 
-def parse_privmsg(line: str) -> tuple[str, str, float] | None:
-    """(канал, текст, время) из строки IRC, либо None."""
+BOTS = {"nightbot", "moobot", "streamelements", "streamlabs", "fossabot", "wizebot", "sery_bot", "botrixoficial",
+        "soundalerts", "kofistreambot", "commanderroot", "pokemoncommunitygame", "own3d", "blerp", "deepbot",
+        "phantombot", "coebot", "vivbot", "stay_hydrated_bot", "streamholics", "creatisbot", "dixperbro"}
+
+
+def is_noise(text: str, user: str = "") -> bool:
+    """Сообщения, которые не реакция зрителей: команды ботам, ответы ботов, «+» в розыгрышах.
+    Без этого чат-игры (!язомби, !elo…) давали ложные «всплески»: до четверти чата — команды."""
+    t = text.strip()
+    u = user.lower()
+    if u in BOTS or (u.endswith("bot") and len(u) > 4):
+        return True
+    return t.startswith("!") or t in ("+", "++", "+++", "+1", "-", "1", "2")
+
+
+def parse_privmsg(line: str) -> tuple[str, str, float, str] | None:
+    """(канал, текст, время, ник автора) из строки IRC, либо None."""
     tags = {}
     if line.startswith("@"):
         raw_tags, _, line = line[1:].partition(" ")
@@ -31,7 +46,8 @@ def parse_privmsg(line: str) -> tuple[str, str, float] | None:
         ts = int(tags.get("tmi-sent-ts", "")) / 1000.0
     except ValueError:
         ts = time.time()
-    return channel, text, ts
+    user = parts[0].lstrip(":").split("!", 1)[0].lower()
+    return channel, text, ts, user
 
 
 class ChatHub:
@@ -39,6 +55,7 @@ class ChatHub:
         self.messages: dict[str, deque[tuple[float, str]]] = {}
         self.log_files: dict[str, Path] = {}
         self.wanted: set[str] = set()
+        self.noise: dict[str, int] = {}  # сколько отброшено команд/ботов (для статистики)
         self._joined: set[str] = set()
         self._writer: asyncio.StreamWriter | None = None
         self.connected = False
@@ -118,7 +135,10 @@ class ChatHub:
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 60)
 
-    def _store(self, channel: str, text: str, ts: float) -> None:
+    def _store(self, channel: str, text: str, ts: float, user: str = "") -> None:
+        if is_noise(text, user):
+            self.noise[channel] = self.noise.get(channel, 0) + 1
+            return
         self.history(channel).append((ts, text))
         path = self.log_files.get(channel)
         if path:

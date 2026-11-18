@@ -244,6 +244,8 @@ python -m clipper add ник                   добавить канал
 python -m clipper remove ник                удалить канал
 python -m clipper list                      список каналов
 python -m clipper doctor                    проверить установку и ключи
+python -m clipper stats [--days 7]          что даёт одобренные клипы (для настройки)
+python -m clipper queue                     что сейчас в обработке
 ```
 
 ## Перед релизом на Windows

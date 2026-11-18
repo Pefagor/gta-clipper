@@ -160,3 +160,19 @@ def test_auth_error_does_not_burn_candidates(app):
         asyncio.run(app._stage_failed(app.db.candidate(cid), "transcribed", LLMAuthError("401"), 6))
     c = app.db.candidate(cid)
     assert c["status"] == "transcribed" and c["attempts"] == 0 and c["next_try_at"] > 0
+
+
+def test_taste_examples_balanced(app):
+    import time
+    def add(status, summary):
+        cid = app.db.add_candidate(kind="clip", channel="x", status=status, screen={"score": 7, "summary": summary})
+        app.db.update_candidate(cid, decided_at=time.time())
+    for i in range(3):
+        add("rejected", f"плохой {i}")
+    assert app.taste_examples() == ""          # одни отказы — вкус не включаем, он сбивает ИИ
+    for i in range(2):
+        add("approved", f"хороший {i}")
+    assert app.taste_examples() == ""          # меньше трёх с каждой стороны
+    add("done", "хороший 2")
+    t = app.taste_examples()
+    assert t.count("✅") == 3 and t.count("❌") == 3

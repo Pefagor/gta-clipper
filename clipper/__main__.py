@@ -250,6 +250,57 @@ def cmd_queue(cfg) -> None:
             print(f"      ошибка: {r['error'][:300]}")
 
 
+def cmd_stats(cfg, days: float) -> None:
+    """Что даёт хорошие клипы: по сигналам, каналам и оценкам Haiku — сколько найдено, прошло ИИ, одобрено вами."""
+    import json
+    import time
+    from collections import defaultdict
+    from .db import DB
+    db = DB(cfg.data_dir / "app.db")
+    rows = db.all("SELECT * FROM candidates WHERE kind='clip' AND created_at>=?", (time.time() - days * 86400,))
+    if not rows:
+        print(f"За {days:g} дн. кандидатов нет.")
+        return
+    trig = {"detector": "чат/звук", "rage": "крик", "viewer_clip": "клип зрителей", "video": "видео: момент",
+            "video_part": "видео: часть"}
+
+    def bucket(r):
+        st = r["status"]
+        if st == "discarded":
+            return "отсеял ИИ"
+        if st in ("approved", "sent", "done"):
+            return "одобрили"
+        if st == "rejected":
+            return "отклонили"
+        if st == "failed":
+            return "ошибка"
+        return "в работе"
+
+    def table(title, key):
+        groups = defaultdict(lambda: defaultdict(int))
+        for r in rows:
+            groups[key(r)][bucket(r)] += 1
+        print(f"\n{title}")
+        print(f"  {'':22} {'всего':>6} {'отсеял ИИ':>10} {'одобрили':>9} {'отклонили':>10} {'% одобр.':>9}")
+        for g, c in sorted(groups.items(), key=lambda x: -sum(x[1].values())):
+            decided = c["одобрили"] + c["отклонили"]
+            rate = f"{100 * c['одобрили'] / decided:.0f}%" if decided else "—"
+            print(f"  {str(g)[:22]:22} {sum(c.values()):>6} {c['отсеял ИИ']:>10} {c['одобрили']:>9} {c['отклонили']:>10} {rate:>9}")
+
+    print(f"Кандидатов за {days:g} дн.: {len(rows)}")
+    table("По сигналу", lambda r: trig.get(r.get("trigger") or "", r.get("trigger") or "?"))
+    table("По каналу", lambda r: r["channel"])
+
+    def haiku(r):
+        sc = r["screen"] if isinstance(r.get("screen"), dict) else {}
+        v = sc.get("score")
+        return f"Haiku {v}/10" if isinstance(v, (int, float)) else "без оценки"
+    table("По оценке Haiku (порог прохода — llm.screen_threshold)", haiku)
+    print("\nКак читать: если у какого-то сигнала или оценки Haiku почти всё отклоняется — это шум, его стоит"
+          "\nослабить (detector.weights / rage_db) или поднять порог; если ИИ отсеивает то, что вы потом"
+          "\nвозвращаете из «Отсеянных», — порог llm.screen_threshold стоит снизить.")
+
+
 def main() -> None:
     p = argparse.ArgumentParser(prog="clipper", description="Нарезка вертикальных клипов из стримов Twitch")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -262,6 +313,8 @@ def main() -> None:
     sub.add_parser("list", help="список каналов")
     sub.add_parser("doctor", help="проверить установку и ключи")
     sub.add_parser("queue", help="что сейчас в обработке и почему")
+    st = sub.add_parser("stats", help="какие сигналы дают одобренные клипы (для настройки)")
+    st.add_argument("--days", type=float, default=7)
     args = p.parse_args()
 
     try:
@@ -274,6 +327,8 @@ def main() -> None:
         sys.exit(asyncio.run(cmd_doctor(cfg)))
     if args.cmd == "queue":
         return cmd_queue(cfg)
+    if args.cmd == "stats":
+        return cmd_stats(cfg, args.days)
     setup_logging(cfg)
     if args.cmd == "run":
         from .errors import explain

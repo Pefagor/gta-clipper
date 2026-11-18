@@ -357,6 +357,9 @@ class App:
         seg = float(self.cfg.section("recording").get("segment_seconds", 4))
         start, end = plan_window(peak, dcfg)
         start = max(start, rec.started_at, self.last_end.get(login, 0) if track else 0)
+        if end - start < 20:  # записи для момента почти нет — вырезать нечего
+            log.debug("[%s] момент пропущен: окно %.0f с", login, end - start)
+            return 0
         chrow = self.db.channel(login)
         cid = self.db.add_candidate(channel=login, session_id=rec.session_id, status="to_cut", trigger=trigger,
                                     game=rec.game or None,
@@ -509,7 +512,8 @@ class App:
         if not chat and not c.get("video_id") and t0 < self._started_at:  # окно до перезапуска программы — читаем лог сессии
             chat = await asyncio.to_thread(self._chat_from_log, c, t0, dur)
         return build_context(c["channel"], c.get("game") or "", transcript_text(tr), chat, c.get("signals") or {},
-                             c["peak_ts"] - t0, dur, screen, name=self.streamer_name(c["channel"]))
+                             c["peak_ts"] - t0, dur, screen, name=self.streamer_name(c["channel"]),
+                             hints=self.game_hints(c.get("game")), taste=self.taste_examples(exclude=c["id"]))
 
     def _chat_from_log(self, c: dict, t0: float, dur: float) -> list[tuple[float, str]]:
         sess = self.db.one("SELECT dir FROM sessions WHERE id=?", (c["session_id"],))
@@ -883,6 +887,31 @@ class App:
                                  error=None, next_try_at=0, edit_start=None, edit_end=None)
         log.info("♻️  #%d возвращён из отсеянных — в монтаж и на модерацию", cid)
         return "в монтаж, потом придёт на модерацию"
+
+    def game_hints(self, game: str | None) -> str:
+        games = self.cfg.get("games") or {}
+        return ((games.get(game or "") or {}).get("hints") or (games.get("_default") or {}).get("hints") or "").strip()
+
+    def taste_examples(self, exclude: int | None = None, per_side: int = 8) -> str:
+        """Ваши последние решения (✅/❌) с кратким описанием — ИИ подстраивается под ваш вкус."""
+        rows = self.db.all("SELECT id, status, game, screen, title FROM candidates WHERE decided_at IS NOT NULL "
+                           "AND kind='clip' AND status IN ('approved','sent','done','rejected') AND id != ? "
+                           "ORDER BY decided_at DESC LIMIT 60", (exclude or -1,))
+        good, bad = [], []
+        for r in rows:
+            sc = r["screen"] if isinstance(r.get("screen"), dict) else {}
+            what = (sc.get("summary") or r.get("title") or "").strip()[:140]
+            if not what or what == "Момент со стрима":
+                continue
+            line = f"{'✅ одобрил' if r['status'] != 'rejected' else '❌ отклонил'}: {what}" + \
+                   (f" ({r['game']})" if r.get("game") else "")
+            (bad if r["status"] == "rejected" else good).append(line)
+        # поровну с обеих сторон и только когда решений достаточно: перекошенные примеры (одни отказы)
+        # сбивали ИИ — на проверке одобренный клип получил 5/10 вместо 7 и был бы отсеян
+        n = min(len(good), len(bad), per_side)
+        if n < 3:
+            return ""
+        return "\n".join(good[:n] + bad[:n])
 
     def streamer_name(self, login: str) -> str:
         """Как называть стримера в заголовках: своё имя из бота → имя на Twitch → ник."""

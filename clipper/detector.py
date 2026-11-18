@@ -17,6 +17,18 @@ class Sample:
     audio: float | None
 
 
+_LAUGH_CHARS = set("хаыъвфзжпщьзэxah)")
+
+
+def is_laugh(text: str) -> bool:
+    """Русский «смех клавиатурой»: ХАХВЫАХФЫХ, ахвхахв, ЪВАЪХВА, ахахаха)))) — частая реакция, которой нет в эмоутах."""
+    t = text.lower().replace(" ", "")
+    if len(t) < 4:
+        return False
+    in_set = sum(ch in _LAUGH_CHARS for ch in t) / len(t)
+    return in_set >= 0.85 and (t.count("х") + t.count("x")) / len(t) >= 0.2
+
+
 def count_recent(history, start: float, end: float, emotes: list[str]) -> tuple[int, int]:
     """Сообщений и сообщений с эмоутами в [start, end]. history — по возрастанию времени."""
     n = e = 0
@@ -28,7 +40,7 @@ def count_recent(history, start: float, end: float, emotes: list[str]) -> tuple[
             continue
         n += 1
         low = text.lower()
-        if any(x in low for x in lowered):
+        if any(x in low for x in lowered) or is_laugh(text):
             e += 1
     return n, e
 
