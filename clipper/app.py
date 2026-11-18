@@ -191,7 +191,8 @@ class App:
                  self._stage("to_cut", self._do_cut), self._stage("cut", self._do_transcribe),
                  self._stage("transcribed", self._do_screen, max_attempts=6),
                  self._stage("screened", self._do_review, max_attempts=6),
-                 self._stage("to_render", self._do_render), self.videos.loop(), self._summary_loop()]
+                 self._stage("to_render", self._do_render), self.videos.loop(), self._summary_loop(),
+                 self._cam_question_timeout_loop()]
         if self.twitch.enabled:
             loops.append(self._clips_loop())
         self._tasks = [asyncio.create_task(c) for c in loops]
@@ -587,21 +588,10 @@ class App:
         info = await probe(self.ffprobe, raw)
         start, end = (c["edit_start"], c["edit_end"]) if c.get("edit_start") is not None else (c["clip_start"], c["clip_end"])
         start, end = max(0.0, start), min(info["duration"] or c["raw_duration"], end)
-        ch = self.db.channel(c["channel"]) or {}
-        mode = self.cam_mode(c["channel"])
-        cam = self.cam_rect(c["channel"], ch)
-        top_media = None
-        if mode == "off":
-            cam = None
-        elif mode == "media":
-            cam = None
-            top_media, _ = self.channel_overlay(c["channel"])
-            if not top_media:
-                log.warning("#%d режим «заставка», но файла заставки нет — монтирую без вебки", c["id"])
-        if cam and not await self._cam_present(raw, d, cam, start, end):
-            # стример поменял раскладку (полноэкранная вебка, сцена «отошёл») — макет без вебки
-            log.info("🎥 #%d [%s] в рамке вебки нет лица — монтирую без вебки", c["id"], c.get("channel") or "?")
-            cam = None
+        decided = await self._clip_cam(c, raw, d, start, end)
+        if decided is None:
+            return  # вебка под вопросом — клип ждёт вашего ответа в боте
+        cam, top_media = decided
         tr = json.loads((d / "transcript.json").read_text(encoding="utf-8"))
         out = d / "clip.mp4"
         layout = "заставка сверху" if top_media else "вебка сверху" if cam else "без вебки"
@@ -617,22 +607,103 @@ class App:
                                  clip_start=start, clip_end=end, edit_start=None, edit_end=None,
                                  card_msg_id=None, attempts=0, error=None)
 
-    async def _cam_present(self, raw: Path, d: Path, cam, start: float, end: float) -> bool:
+    async def _clip_cam(self, c: dict, raw: Path, d: Path, start: float, end: float):
+        """Что ставить сверху в этом клипе: (рамка вебки | None, заставка | None).
+        None — вебка под сомнением: клип ушёл в ожидание ответа в боте."""
+        login = c["channel"]
+        ov = c.get("cam_override") if isinstance(c.get("cam_override"), dict) else None
+        if ov:  # вы уже решили для этого клипа (в вопросе или кнопкой 🎥 в карточке)
+            if ov.get("mode") == "off":
+                return None, None
+            if ov.get("mode") == "media":
+                return None, self.channel_overlay(login)[0]
+            if ov.get("mode") == "rect" and ov.get("rect"):
+                return tuple(ov["rect"]), None
+            if ov.get("mode") == "on":
+                rect = self.cam_rect(login) or (tuple(self.db.kv_get(f"cam:{login}")) if self.db.kv_get(f"cam:{login}") else None)
+                return rect, None
+        mode = self.cam_mode(login)
+        if mode == "off":
+            return None, None
+        if mode == "media":
+            media = self.channel_overlay(login)[0]
+            if not media:
+                log.warning("#%d режим «заставка», но файла заставки нет — монтирую без вебки", c["id"])
+            return None, media
+        cam = self.cam_rect(login)
+        if not cam:
+            return None, None
+        check = await self._cam_check(raw, d, cam, start, end)
+        if check is None or self._cam_confident(login, check):
+            return cam, None
+        # сомнение: стример сменил раскладку, отвернулся или рамка съехала — спрашиваем
+        if not self.bot:
+            log.info("🎥 #%d [%s] вебка под сомнением, бота нет — монтирую без вебки", c["id"], login)
+            return None, None
+        frame = await self.clip_frame(c, (start + end) / 2)
+        waiting = self.db.scalar("SELECT COUNT(*) FROM candidates WHERE channel=? AND status='cam_check'", (login,)) or 0
+        self.db.update_candidate(c["id"], status="cam_check", cam_check=json.dumps(check), cam_asked_at=time.time())
+        log.info("🎥 #%d [%s] не уверен, что вебка на месте (края %.0f%%, лицо на %d из 8 кадров) — спрашиваю в боте",
+                 c["id"], login, check.get("border", 0) * 100, check.get("hits", 0))
+        if not waiting:  # один вопрос на канал: остальные сомнительные клипы ждут его же ответа
+            await self.bot.send_cam_question(c, frame, cam, check)
+        return None
+
+    def _cam_confident(self, login: str, check: dict) -> bool:
+        """Уверены, что вебка на месте. Порог по краям учится: если вы ответили «на месте», похожие
+        случаи этого канала больше не спрашиваются."""
+        trust = self.db.kv_get(f"cam_trust:{login}") or 0.45
+        return check.get("border", 0) >= trust or (check.get("hits", 0) >= 2 and check.get("border", 0) >= 0.3)
+
+    async def _cam_check(self, raw: Path, d: Path, cam, start: float, end: float) -> dict | None:
         if not self.cfg.section("render").get("check_cam", True):
-            return True
+            return None
         frames = await extract_frames(self.ffmpeg, raw, d, spread(end - start, 8, None, None), "cam", scale=None,
                                       offset=start)
         if not frames:
-            return True
+            return None
         code, out = await run([sys.executable, "-m", "clipper.camcal", "check", *map(str, cam),
                                *(str(p) for _, p in frames)], timeout=120)
         for _, p in frames:
             p.unlink(missing_ok=True)
         try:
-            return bool(json.loads(out.strip().splitlines()[-1])["present"]) if code == 0 else True
+            return json.loads(out.strip().splitlines()[-1]) if code == 0 else None
         except (ValueError, KeyError, IndexError):
             log.warning("проверка вебки: %s", out[-300:])
-            return True  # проверка сломалась — не портим клип, оставляем вебку
+            return None  # проверка сломалась — не портим клип, оставляем вебку
+
+    async def clip_frame(self, c: dict, at: float | None = None) -> Path | None:
+        """Кадр из фрагмента кандидата (исходный размер) — для вопроса о вебке и подстройки рамки."""
+        d = Path(c["dir"])
+        if at is None:
+            at = ((c.get("clip_start") or 0) + (c.get("clip_end") or c.get("raw_duration") or 0)) / 2
+        out = d / "camq.jpg"
+        code, _ = await run([self.ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-ss", f"{max(at, 0):.2f}",
+                             "-i", str(d / "raw.mp4"), "-frames:v", "1", "-q:v", "3", str(out)], timeout=60)
+        return out if code == 0 and out.exists() else None
+
+    def resolve_cam_question(self, login: str, override: dict, learn: bool = False) -> int:
+        """Ваш ответ на вопрос о вебке — для всех ждущих клипов канала. Возвращает, сколько клипов пошло в монтаж."""
+        rows = self.db.all("SELECT id, cam_check FROM candidates WHERE channel=? AND status='cam_check'", (login,))
+        if learn:  # «на месте» — запоминаем, какие края считать нормальными для этого канала
+            borders = [json.loads(r["cam_check"]).get("border", 0) for r in rows if r.get("cam_check")]
+            if borders:
+                trust = max(0.15, min(borders) * 0.85)
+                self.db.kv_set(f"cam_trust:{login}", min(trust, self.db.kv_get(f"cam_trust:{login}") or 0.45))
+        for r in rows:
+            self.db.update_candidate(r["id"], status="to_render", cam_override=override, next_try_at=0)
+        return len(rows)
+
+    async def _cam_question_timeout_loop(self) -> None:
+        """Нет ответа на вопрос о вебке долго — монтируем без вебки, чтобы очередь не стояла."""
+        while True:
+            await asyncio.sleep(60)
+            limit = float(self.cfg.section("render").get("cam_ask_minutes", 30)) * 60
+            for r in self.db.all("SELECT DISTINCT channel FROM candidates WHERE status='cam_check' AND cam_asked_at<?",
+                                 (time.time() - limit,)):
+                n = self.resolve_cam_question(r["channel"], {"mode": "off", "auto": True})
+                log.info("🎥 [%s] на вопрос о вебке нет ответа %d мин — %d клип. монтирую без вебки",
+                         r["channel"], limit // 60, n)
 
     # ---------- подборки ----------
     def compilation_tags(self) -> list[tuple[str, str, int]]:
@@ -1014,7 +1085,7 @@ class App:
             "channels": len(self.db.channels(("active", "paused", "removing"))),
             "moderation": self.db.count("rendered"),
             "publish": q("SELECT COUNT(*) FROM candidates WHERE status='approved'"),
-            "processing": q("SELECT COUNT(*) FROM candidates WHERE status IN ('to_cut','cut','transcribed','screened','to_render')"),
+            "processing": q("SELECT COUNT(*) FROM candidates WHERE status IN ('to_cut','cut','transcribed','screened','to_render','cam_check')"),
             "cand_today": q("SELECT COUNT(*) FROM candidates WHERE kind='clip' AND created_at>=?", today),
             "approved_today": q("SELECT COUNT(*) FROM candidates WHERE decided_at>=? AND status IN ('approved','sent','done')", today),
             "posted_today": q("SELECT COUNT(*) FROM candidates WHERE sent_at>=? AND (pub_shorts=1 OR pub_tiktok=1)", today),

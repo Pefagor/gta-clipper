@@ -80,7 +80,7 @@ CREATE TABLE IF NOT EXISTS videos (
 );
 """
 
-JSON_FIELDS = {"signals", "screen", "review", "titles", "parts"}
+JSON_FIELDS = {"signals", "screen", "review", "titles", "parts", "cam_override"}
 
 
 class DB:
@@ -99,7 +99,8 @@ class DB:
         if "game" not in cols:
             self.conn.execute("ALTER TABLE candidates ADD COLUMN game TEXT")
         for col, typ in (("overlay_text", "TEXT"), ("video_id", "INTEGER"), ("part", "TEXT"), ("credit", "TEXT"),
-                         ("source_url", "TEXT"), ("video_pos", "REAL")):
+                         ("source_url", "TEXT"), ("video_pos", "REAL"), ("cam_override", "TEXT"),
+                         ("cam_check", "TEXT"), ("cam_asked_at", "REAL")):
             if col not in cols:
                 self.conn.execute(f"ALTER TABLE candidates ADD COLUMN {col} {typ}")
         ch_cols = {r[1] for r in self.conn.execute("PRAGMA table_info(channels)")}

@@ -218,7 +218,7 @@ async def cmd_doctor(cfg) -> int:
 
 STAGE = {"to_cut": "ждёт вырезки", "cut": "ждёт распознавания речи", "transcribed": "ждёт Haiku",
          "screened": "ждёт Sonnet", "to_render": "ждёт монтажа", "rendered": "на модерации",
-         "approved": "ждёт публикации", "failed": "ошибка"}
+         "approved": "ждёт публикации", "failed": "ошибка", "cam_check": "ждёт ответа про вебку"}
 
 
 def cmd_queue(cfg) -> None:
@@ -232,7 +232,7 @@ def cmd_queue(cfg) -> None:
             pass
     db = DB(cfg.data_dir / "app.db")
     rows = db.all("SELECT id, channel, status, attempts, error, next_try_at, created_at FROM candidates "
-                  "WHERE status IN ('to_cut','cut','transcribed','screened','to_render','rendered','approved') "
+                  "WHERE status IN ('to_cut','cut','transcribed','screened','to_render','rendered','approved','cam_check') "
                   "OR (status='failed' AND updated_at > ?) ORDER BY id", (time.time() - 86400,))
     if not rows:
         print("Очередь пуста.")

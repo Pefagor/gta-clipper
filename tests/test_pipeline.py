@@ -176,3 +176,49 @@ def test_taste_examples_balanced(app):
     add("done", "хороший 2")
     t = app.taste_examples()
     assert t.count("✅") == 3 and t.count("❌") == 3
+
+
+def test_cam_doubt_asks_and_learns(app, tmp_path):
+    """Вебка под сомнением → клип ждёт, бот спрашивает один раз на канал; «на месте» → монтаж с вебкой,
+    и похожие случаи больше не спрашиваются; «✏️/🎥» в карточке — своя рамка для клипа."""
+    import asyncio
+    asked = []
+
+    class FakeBot:
+        async def send_cam_question(self, c, frame, rect, check):
+            asked.append(c["id"])
+
+    app.bot = FakeBot()
+    app.db.execute("INSERT INTO channels(login,display_name,state,added_at,cam_status,cam_x,cam_y,cam_w,cam_h) "
+                   "VALUES('s','s','active',0,'ok',0.79,0,0.21,0.26)")
+    weak = {"present": True, "hits": 0, "border": 0.3}
+
+    async def fake_check(*a, **k):
+        return dict(weak)
+
+    async def fake_frame(*a, **k):
+        return None
+    app._cam_check = fake_check
+    app.clip_frame = fake_frame
+    d = tmp_path / "c"
+    d.mkdir()
+    ids = [app.db.add_candidate(kind="clip", channel="s", status="to_render", dir=str(d)) for _ in range(2)]
+
+    async def go():
+        for cid in ids:
+            assert await app._clip_cam(app.db.candidate(cid), d / "raw.mp4", d, 0, 30) is None
+        assert [app.db.candidate(i)["status"] for i in ids] == ["cam_check", "cam_check"]
+        assert asked == [ids[0]]                       # один вопрос на канал
+        assert app.resolve_cam_question("s", {"mode": "on"}, learn=True) == 2
+        c = app.db.candidate(ids[0])
+        assert c["status"] == "to_render" and c["cam_override"] == {"mode": "on"}
+        assert await app._clip_cam(c, d / "raw.mp4", d, 0, 30) == ((0.79, 0, 0.21, 0.26), None)
+        # новый клип с такими же краями — уже без вопроса (порог выучен)
+        new = app.db.add_candidate(kind="clip", channel="s", status="to_render", dir=str(d))
+        assert await app._clip_cam(app.db.candidate(new), d / "raw.mp4", d, 0, 30) == ((0.79, 0, 0.21, 0.26), None)
+        assert len(asked) == 1
+        # своя рамка для одного клипа из карточки
+        app.db.update_candidate(new, cam_override={"mode": "rect", "rect": [0.1, 0.1, 0.2, 0.2]})
+        assert await app._clip_cam(app.db.candidate(new), d / "raw.mp4", d, 0, 30) == ((0.1, 0.1, 0.2, 0.2), None)
+
+    asyncio.run(go())

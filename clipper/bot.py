@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import asyncio
+import shutil
+import sys
 import html
 import logging
 import time
@@ -19,6 +21,7 @@ from aiogram.types import (CallbackQuery, FSInputFile, InlineKeyboardButton, Inl
                            KeyboardButton, Message, ReplyKeyboardMarkup)
 
 from .db import day_start
+from .tools import run as run_tool
 from .platforms import link as platform_link, platform_of
 from .version import full_version
 from .videos import fmt_ts
@@ -266,13 +269,18 @@ class BotUI:
         lines.append(f"«{html.escape(c.get('title') or '')}»")
         if c.get("overlay_text") is not None:
             lines.append(f"🔤 На видео: «{html.escape(c['overlay_text'])}»" if c["overlay_text"] else "🔤 Без надписи на видео")
+        ov = c.get("cam_override") if isinstance(c.get("cam_override"), dict) else None
+        if ov:
+            lines.append({"off": "🎥 без вебки" + (" (не было ответа на вопрос о вебке)" if ov.get("auto") else ""),
+                          "on": "🎥 с вебкой", "rect": "🎥 своя рамка вебки", "media": "🎥 заставка вместо вебки"}
+                         .get(ov.get("mode"), ""))
         lines.append(f"⏱ {fmt_dur(c.get('render_duration'))} · В очереди ещё: {queue}")
         return "\n".join(lines)
 
     def _card_kb(self, cid: int) -> InlineKeyboardMarkup:
         return kb([[("✅ Одобрить", f"m:ok:{cid}"), ("❌ Отклонить", f"m:no:{cid}")],
                    [("✂️ Обрезать", f"m:cut:{cid}"), ("📝 Заголовок", f"m:title:{cid}")],
-                   [("🔤 Надпись на видео", f"m:ovr:{cid}")]])
+                   [("🔤 Надпись на видео", f"m:ovr:{cid}"), ("🎥 Вебка", f"ce:menu:{cid}")]])
 
     async def _send_card(self, c: dict) -> bool:
         """Отправляет карточку. False — клип отправить нельзя (он помечен failed), нужно брать следующий."""
@@ -903,7 +911,8 @@ class BotUI:
         login = arg
         if action == "ok":
             self.app.accept_cam(login, self.db.kv_get(f"cam:{login}"))
-            await self._edit(q.message, "✅ Вебка сохранена")
+            n = self.app.resolve_cam_question(login, {"mode": "on"})
+            await self._edit(q.message, "✅ Вебка сохранена" + (f" — {n} клип. ушло в монтаж с ней" if n else ""))
         elif action == "none":
             self.app.accept_cam(login, None)
             await self._edit(q.message, "🚫 Сохранено: без вебки")
@@ -978,6 +987,142 @@ class BotUI:
             await self._safe(q.message.edit_media(
                 media=InputMediaPhoto(media=FSInputFile(photo), caption=caption),
                 reply_markup=self._cam_adjust_kb(login)))
+        await self._safe(q.answer())
+
+    # ================= вебка перед монтажом и в карточке =================
+    async def send_cam_question(self, c: dict, frame: Path | None, rect, check: dict) -> None:
+        """Перед монтажом вебка под сомнением — показываем кадр из клипа с рамкой и спрашиваем."""
+        if not self.owner_id:
+            return
+        login, cid = c["channel"], c["id"]
+        name = html.escape(self.app.streamer_name(login))
+        photo = None
+        if frame:
+            out = frame.with_name("camq_rect.jpg")
+            code, _ = await run_tool([sys.executable, "-m", "clipper.camcal", "draw", str(frame), str(out), *map(str, rect)])
+            photo = out if code == 0 and out.exists() else frame
+        caption = (f"🎥 <b>{name}</b>, клип #{cid}: не уверен, что вебка на месте — края рамки видны на "
+                   f"{check.get('border', 0):.0%}, лицо на {check.get('hits', 0)} из 8 кадров.\n"
+                   "Стример мог сменить раскладку, отвернуться или рамка съехала. Остальные такие клипы канала ждут "
+                   f"этого ответа (без ответа {int(self.app.cfg.section('render').get('cam_ask_minutes', 30))} мин — "
+                   "смонтирую без вебки).")
+        buttons = kb([[("✅ Вебка на месте", f"kq:on:{cid}"), ("🚫 Без вебки", f"kq:off:{cid}")],
+                      [("✏️ Подправить рамку", f"kq:adj:{cid}"), ("📸 Прислать вырезку", f"cam:tpl:{login}")]])
+        try:
+            if photo:
+                await self.bot.send_photo(self.owner_id, FSInputFile(photo), caption=caption, reply_markup=buttons)
+            else:
+                await self.bot.send_message(self.owner_id, caption, reply_markup=buttons)
+        except Exception as e:  # noqa: BLE001
+            log.warning("telegram: %s", e)
+
+    async def cb_kq(self, q, state, action, arg, parts):
+        c = self.db.candidate(int(arg))
+        if not c:
+            return await q.answer("Клип не найден")
+        login = c["channel"]
+        if action in ("on", "off"):
+            n = self.app.resolve_cam_question(login, {"mode": action}, learn=action == "on")
+            await self._edit(q.message, ("✅ Монтирую с вебкой" if action == "on" else "🚫 Монтирую без вебки")
+                             + f" — клипов: {n}." + (" Похожие случаи больше не спрашиваю." if action == "on" else ""))
+            return await q.answer()
+        if action == "adj":  # подстройка рамки канала по кадру из этого клипа
+            frame = await self.app.clip_frame(c)
+            if not frame:
+                return await q.answer("Не получилось взять кадр из клипа", show_alert=True)
+            work = self.app.cfg.data_dir / "cam" / login
+            work.mkdir(parents=True, exist_ok=True)
+            shutil.copy(frame, work / "base.jpg")
+            if not self.db.kv_get(f"cam:{login}"):
+                self.db.kv_set(f"cam:{login}", list(self.app.cam_rect(login) or [0.75, 0.0, 0.25, 0.3]))
+            photo = await self.app.draw_cam_preview(login, self.db.kv_get(f"cam:{login}"))
+            await self.bot.send_photo(self.owner_id, FSInputFile(photo or frame), reply_markup=self._cam_adjust_kb(login),
+                                      caption="🎥 Подстройка рамки по кадру из этого клипа. «Готово» — сохранить "
+                                              "и смонтировать ждущие клипы с ней.")
+        await self._safe(q.answer())
+
+    def _clip_cam_kb(self, cid: int) -> InlineKeyboardMarkup:
+        return kb([[("🚫 Без вебки", f"ce:off:{cid}"), ("✅ С вебкой канала", f"ce:on:{cid}")],
+                   [("✏️ Своя рамка для клипа", f"ce:rect:{cid}"), ("🖼 Заставка", f"ce:media:{cid}")],
+                   [("← Назад", f"ce:back:{cid}")]])
+
+    async def _rerender_with_cam(self, cid: int, override: dict) -> bool:
+        async with self._card_lock:
+            c = self.db.candidate(cid)
+            if not c or c["status"] != "rendered" or c["kind"] != "clip":
+                return False
+            self.db.update_candidate(cid, cam_override=override, card_msg_id=None, status="to_render",
+                                     edit_start=c["clip_start"], edit_end=c["clip_end"])
+            self.db.kv_set("card_id", cid)
+            return True
+
+    async def cb_ce(self, q, state, action, arg, parts):
+        """🎥 в карточке модерации: вебка именно для этого клипа."""
+        cid = int(arg)
+        c = self.db.candidate(cid)
+        if not c or c["status"] != "rendered":
+            return await q.answer("Клип уже обработан")
+        login = c["channel"]
+        if action == "menu":
+            await self._safe(q.message.edit_reply_markup(reply_markup=self._clip_cam_kb(cid)))
+            return await q.answer()
+        if action == "back":
+            await self._safe(q.message.edit_reply_markup(reply_markup=self._card_kb(cid)))
+            return await q.answer()
+        if action == "on" and not (self.app.cam_rect(login) or self.db.kv_get(f"cam:{login}")):
+            return await q.answer("У канала нет рамки вебки — выберите «Своя рамка для клипа»", show_alert=True)
+        if action == "media" and not self.app.channel_overlay(login)[0]:
+            return await q.answer("Нет файла заставки — загрузите в карточке канала или в Настройках", show_alert=True)
+        if action in ("off", "on", "media"):
+            await self._safe(q.message.delete())
+            await self._rerender_with_cam(cid, {"mode": action})
+            return await q.answer("Перемонтирую")
+        if action == "rect":
+            frame = await self.app.clip_frame(c)
+            if not frame:
+                return await q.answer("Не получилось взять кадр из клипа", show_alert=True)
+            rect = list(self.app.cam_rect(login) or self.db.kv_get(f"cam:{login}") or [0.75, 0.0, 0.25, 0.3])
+            self.db.kv_set(f"camclip:{cid}", rect)
+            await self._send_clip_rect(cid, frame, rect)
+        await self._safe(q.answer())
+
+    def _clip_rect_kb(self, cid: int) -> InlineKeyboardMarkup:
+        return kb([[("⬅️", f"ca:l:{cid}"), ("⬆️", f"ca:u:{cid}"), ("⬇️", f"ca:d:{cid}"), ("➡️", f"ca:r:{cid}")],
+                   [("◀ левый", f"ca:Ll:{cid}"), ("левый ▶", f"ca:Lr:{cid}"),
+                    ("◀ правый", f"ca:Rl:{cid}"), ("правый ▶", f"ca:Rr:{cid}")],
+                   [("▲ верх", f"ca:Tu:{cid}"), ("верх ▼", f"ca:Td:{cid}"), ("▲ низ", f"ca:Bu:{cid}"), ("низ ▼", f"ca:Bd:{cid}")],
+                   [("↔️ шире", f"ca:w+:{cid}"), ("↔️ уже", f"ca:w-:{cid}"), ("↕️ выше", f"ca:h+:{cid}"), ("↕️ ниже", f"ca:h-:{cid}")],
+                   [("✅ Для этого клипа", f"ca:done:{cid}"), ("💾 И для канала", f"ca:save:{cid}")]])
+
+    async def _send_clip_rect(self, cid: int, frame: Path, rect, msg: Message | None = None) -> None:
+        out = frame.with_name("camq_adj.jpg")
+        code, _ = await run_tool([sys.executable, "-m", "clipper.camcal", "draw", str(frame), str(out), *map(str, rect)])
+        photo = FSInputFile(out if code == 0 and out.exists() else frame)
+        caption = f"🎥 Рамка вебки для клипа #{cid}. Края двигаются по ~8 пикселей."
+        if msg:
+            await self._safe(msg.edit_media(media=InputMediaPhoto(media=photo, caption=caption),
+                                            reply_markup=self._clip_rect_kb(cid)))
+        else:
+            await self.bot.send_photo(self.owner_id, photo, caption=caption, reply_markup=self._clip_rect_kb(cid))
+
+    async def cb_ca(self, q, state, action, arg, parts):
+        cid = int(arg)
+        c = self.db.candidate(cid)
+        rect = self.db.kv_get(f"camclip:{cid}")
+        if not c or not rect:
+            return await q.answer("Клип уже обработан")
+        if action in ("done", "save"):
+            if action == "save":
+                self.app.accept_cam(c["channel"], rect)
+            ok = await self._rerender_with_cam(cid, {"mode": "rect", "rect": rect})
+            await self._edit(q.message, "✅ Рамка применена — перемонтирую клип" + (" и сохранил для канала" if action == "save" else "")
+                             if ok else "Клип уже обработан")
+            return await q.answer()
+        rect = adjust_rect(rect, action)
+        self.db.kv_set(f"camclip:{cid}", rect)
+        frame = Path(c["dir"]) / "camq.jpg"
+        if frame.exists():
+            await self._send_clip_rect(cid, frame, rect, q.message)
         await self._safe(q.answer())
 
     # ================= видео по ссылке =================

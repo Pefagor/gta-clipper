@@ -67,6 +67,7 @@ render:
   encoder: auto              # auto | h264_nvenc | h264_videotoolbox | libx264
   font: Arial
   loudness_lufs: -14
+  cam_ask_minutes: 30         # нет ответа на вопрос «вебка на месте?» — монтировать без вебки
 
 compilation:
   min_clips: 3
